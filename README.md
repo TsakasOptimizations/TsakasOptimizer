@@ -9,7 +9,7 @@ One file, no dependencies, no telemetry, no admin rights to install.
 One line in any PowerShell window. No admin rights, nothing to unzip:
 
 ```
-irm https://raw.githubusercontent.com/TsakasOptimizations/Optimizer/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/TsakasOptimizations/TsakasOptimizer/main/install.ps1 | iex
 ```
 
 That installs TsakasOptimizer to `%LOCALAPPDATA%\TsakasOptimizer`, adds a Start Menu and a

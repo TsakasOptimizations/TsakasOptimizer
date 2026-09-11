@@ -3,11 +3,11 @@
   Installs TsakasOptimizer to %LOCALAPPDATA%\TsakasOptimizer and adds Start Menu and desktop
   shortcuts. No admin rights needed. Run it again to reinstall or repair.
 
-    irm https://raw.githubusercontent.com/TsakasOptimizations/Optimizer/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/TsakasOptimizations/TsakasOptimizer/main/install.ps1 | iex
 #>
 $ErrorActionPreference = 'Stop'
 
-$Repo   = 'TsakasOptimizations/Optimizer'
+$Repo   = 'TsakasOptimizations/TsakasOptimizer'
 $RawUrl = "https://raw.githubusercontent.com/$Repo/main/TsakasOptimizer.ps1"
 $Dir    = Join-Path $env:LOCALAPPDATA 'TsakasOptimizer'
 $Script = Join-Path $Dir 'TsakasOptimizer.ps1'
