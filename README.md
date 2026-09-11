@@ -1,4 +1,4 @@
-# Optimizer
+# TsakasOptimizer
 
 A single PowerShell script that looks at what is running on a Windows PC, points
 out what is safe to close or set to Manual, and asks before changing anything.
@@ -12,7 +12,7 @@ One line in any PowerShell window. No admin rights, nothing to unzip:
 irm https://raw.githubusercontent.com/TsakasOptimizations/Optimizer/main/install.ps1 | iex
 ```
 
-That installs Optimizer to `%LOCALAPPDATA%\Optimizer`, adds a Start Menu and a
+That installs TsakasOptimizer to `%LOCALAPPDATA%\TsakasOptimizer`, adds a Start Menu and a
 desktop shortcut, and opens it. It stays on the PC - launch it any time from the
 Start Menu. To update later, open it and press `Check for updates`.
 
@@ -25,12 +25,12 @@ elevated, or right-click the shortcut and choose Run as administrator.
 
 ### Without installing
 
-Download the folder and double-click `Optimizer.cmd`, which resolves its own
+Download the folder and double-click `TsakasOptimizer.cmd`, which resolves its own
 folder and works from anywhere. From a terminal, cd into the folder first:
 
 ```
-cd C:\path\to\Optimizer
-powershell -ExecutionPolicy Bypass -File .\Optimizer.ps1
+cd C:\path\to\TsakasOptimizer
+powershell -ExecutionPolicy Bypass -File .\TsakasOptimizer.ps1
 ```
 
 If Windows blocks the download, right-click the file, Properties, tick Unblock.
@@ -38,8 +38,8 @@ If Windows blocks the download, right-click the file, Properties, tick Unblock.
 ### Uninstall
 
 ```
-Remove-Item "$env:LOCALAPPDATA\Optimizer" -Recurse -Force
-Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Optimizer.lnk", "$env:USERPROFILE\Desktop\Optimizer.lnk" -Force
+Remove-Item "$env:LOCALAPPDATA\TsakasOptimizer" -Recurse -Force
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\TsakasOptimizer.lnk", "$env:USERPROFILE\Desktop\TsakasOptimizer.lnk" -Force
 ```
 
 Services you set to Manual stay that way - press Undo in the app before removing
@@ -84,8 +84,8 @@ SPD/rated profile. Verify the loaded values in BIOS, ZenTimings or CPU-Z.
 
 `Check for updates` compares the `$Version` line in the installed script against
 the copy published at `$RawUrl`. A blue dot appears when a newer one exists;
-accepting it backs the current file up as `Optimizer.ps1.bak`, writes the new
+accepting it backs the current file up as `TsakasOptimizer.ps1.bak`, writes the new
 version and restarts.
 
-To publish your own build, set `$Repo` at the top of `Optimizer.ps1` to your
+To publish your own build, set `$Repo` at the top of `TsakasOptimizer.ps1` to your
 repo (`owner/name`), then bump `$Version` with every release.

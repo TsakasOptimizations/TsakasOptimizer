@@ -1,18 +1,18 @@
 #requires -Version 5.1
 <#
-  Optimizer.ps1 - scans running processes + auto-start services, flags the ones
+  TsakasOptimizer.ps1 - scans running processes + auto-start services, flags the ones
   commonly safe to close or switch to Manual, and asks before touching anything.
   Service changes are logged so -Undo can put them back.
   #>
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.0.2'
+$Version = '1.1.0'
 $Repo    = 'TsakasOptimizations/Optimizer'
 $Branch  = 'main'
-$RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/Optimizer.ps1"
+$RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
 
-$Root = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $env:LOCALAPPDATA 'Optimizer' }
+$Root = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $env:LOCALAPPDATA 'TsakasOptimizer' }
 $UndoFile = Join-Path $Root 'optimizer-undo.json'
 
 # --- updates -----------------------------------------------------------------
@@ -500,13 +500,105 @@ function Get-MemoryNotes([object[]]$Dimms, [int]$Slots, [string]$Cpu) {
   return $n
 }
 
+# --- motherboard and drivers -------------------------------------------------
+function Get-BoardInfo {
+  $bb   = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
+  $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+  $cs   = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+  $date = $bios.ReleaseDate
+  [pscustomobject]@{
+    Vendor    = ($bb.Manufacturer, $cs.Manufacturer | Where-Object { $_ } | Select-Object -First 1)
+    Model     = ($bb.Product, $cs.Model | Where-Object { $_ } | Select-Object -First 1)
+    Bios      = $bios.SMBIOSBIOSVersion
+    BiosDate  = $date
+    AgeMonths = $(if ($date) { [math]::Round(((Get-Date) - $date).TotalDays / 30.4, 1) } else { $null })
+    Cpu       = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).Name
+  }
+}
+
+function Get-BiosNotes($Board) {
+  $n = New-Object System.Collections.ArrayList
+  if (-not $Board.Bios) { [void]$n.Add('Could not read BIOS information.'); return $n }
+
+  [void]$n.Add(("Board: {0} {1}" -f $Board.Vendor, $Board.Model))
+  [void]$n.Add(("BIOS:  {0}, released {1:yyyy-MM-dd} ({2} months ago)" -f $Board.Bios, $Board.BiosDate, $Board.AgeMonths))
+  [void]$n.Add('')
+
+  $am5 = $Board.Cpu -match 'Ryzen\s+\d\s+[79]\d{3}'
+  if ($Board.AgeMonths -lt 6) {
+    [void]$n.Add('[ok] That BIOS is recent. Nothing to do unless you are chasing a specific bug.')
+  } elseif ($Board.AgeMonths -lt 18) {
+    [void]$n.Add('[i] A newer BIOS probably exists. Worth updating only if you have a reason: memory instability, a new CPU, or a fix listed in the changelog.')
+  } else {
+    [void]$n.Add('[!] This BIOS is over 18 months old. Vendors ship real fixes in that time - check the changelog on the support page.')
+  }
+  if ($am5) {
+    [void]$n.Add('    On AM5 specifically, BIOS updates carry AGESA versions that fix memory training and EXPO stability. If your RAM is fussy, this is the first thing to try.')
+  }
+  [void]$n.Add('')
+  [void]$n.Add('Windows cannot tell you which BIOS version is the newest - only the vendor page lists that. Use the button below, match your exact model, and compare against the version above.')
+  [void]$n.Add('')
+  [void]$n.Add('--- PROCEED WITH CAUTION - a failed BIOS flash can leave the board unbootable. Use the vendor tool (Q-Flash, M-Flash, EZ Flash), never flash on an unstable machine, and do not cut power during it. ---')
+  return $n
+}
+
+# Only these classes matter here; the query is filtered server-side to keep it quick.
+function Get-DriverInfo {
+  $rows = New-Object System.Collections.ArrayList
+  $all = Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue -Filter `
+    "DeviceClass='NET' OR DeviceClass='MEDIA' OR DeviceClass='SYSTEM' OR DeviceClass='DISPLAY'"
+
+  # virtual and debug adapters are not drivers anyone updates
+  $noise = 'Miniport|Kernel Debug|Virtual|Loopback|Teefer|TAP-|Wintun|Wi-Fi Direct|Microsoft Hyper-V'
+
+  foreach ($g in @(
+      @{ Cat = 'Chipset'; Rows = @($all | Where-Object { $_.DeviceClass -eq 'SYSTEM' -and $_.DriverProviderName -notlike 'Microsoft*' }) }
+      @{ Cat = 'Network'; Rows = @($all | Where-Object { $_.DeviceClass -eq 'NET' -and $_.DeviceName -notmatch $noise -and $_.DriverProviderName -notlike 'Microsoft*' }) }
+      @{ Cat = 'Audio';   Rows = @($all | Where-Object { $_.DeviceClass -eq 'MEDIA' -and $_.DeviceName -notmatch $noise }) }
+      @{ Cat = 'Graphics';Rows = @($all | Where-Object { $_.DeviceClass -eq 'DISPLAY' }) })) {
+
+    if ($g.Rows.Count -eq 0) {
+      [void]$rows.Add([pscustomobject]@{
+        Category = $g.Cat; Device = 'none found with a vendor driver'; Provider = 'Microsoft generic'
+        Version = '-'; Date = $null; Note = 'Windows is using its own driver. The vendor one usually adds features and fixes.' })
+      continue
+    }
+    # chipset ships as one package, so report it as one line dated by its oldest piece
+    if ($g.Cat -eq 'Chipset') {
+      $oldest = $g.Rows | Sort-Object DriverDate | Select-Object -First 1
+      [void]$rows.Add([pscustomobject]@{
+        Category = 'Chipset'; Device = ("{0} chipset ({1} devices)" -f ($oldest.DriverProviderName -replace ',.*$', ''), $g.Rows.Count)
+        Provider = $oldest.DriverProviderName; Version = $oldest.DriverVersion; Date = $oldest.DriverDate
+        Note = (Get-DriverNote $oldest.DriverProviderName $oldest.DriverDate) })
+      continue
+    }
+    foreach ($d in $g.Rows) {
+      [void]$rows.Add([pscustomobject]@{
+        Category = $g.Cat; Device = $d.DeviceName; Provider = $d.DriverProviderName
+        Version = $d.DriverVersion; Date = $d.DriverDate; Note = (Get-DriverNote $d.DriverProviderName $d.DriverDate) })
+    }
+  }
+  $rows
+}
+
+function Get-DriverNote([string]$Provider, $Date) {
+  $notes = @()
+  if ($Provider -like 'Microsoft*') { $notes += 'generic Windows driver - the vendor one usually adds features and fixes' }
+  if ($Date) {
+    $years = ((Get-Date) - $Date).TotalDays / 365
+    if ($years -gt 3)     { $notes += 'over 3 years old' }
+    elseif ($years -gt 2) { $notes += 'over 2 years old' }
+  }
+  $notes -join '; '
+}
+
 # --- gui ---------------------------------------------------------------------
 function Show-Gui {
   Add-Type -AssemblyName System.Windows.Forms
   Add-Type -AssemblyName System.Drawing
 
   $form = New-Object Windows.Forms.Form
-  $form.Text = "Optimizer $Version"
+  $form.Text = "TsakasOptimizer $Version"
   $form.ClientSize = New-Object Drawing.Size(836, 584)
   $form.MinimumSize = New-Object Drawing.Size(700, 520)
   $form.StartPosition = 'CenterScreen'
@@ -542,13 +634,15 @@ function Show-Gui {
   $tabs.Padding = New-Object Drawing.Point(14, 5)
   $tab1 = New-Object Windows.Forms.TabPage; $tab1.Text = 'Processes and services'
   $tab2 = New-Object Windows.Forms.TabPage; $tab2.Text = 'Memory'
-  foreach ($t in @($tab1, $tab2)) { $t.BackColor = [Drawing.Color]::White; $t.UseVisualStyleBackColor = $false }
-  $tabs.TabPages.AddRange(@($tab1, $tab2))
+  $tab3 = New-Object Windows.Forms.TabPage; $tab3.Text = 'Motherboard'
+  foreach ($t in @($tab1, $tab2, $tab3)) { $t.BackColor = [Drawing.Color]::White; $t.UseVisualStyleBackColor = $false }
+  $tabs.TabPages.AddRange(@($tab1, $tab2, $tab3))
   $form.Controls.Add($tabs)
   # a TabPage defaults to 200x100; set the real size before adding anchored children
   $pageSize = New-Object Drawing.Size($tabs.DisplayRectangle.Width, $tabs.DisplayRectangle.Height)
   $tab1.Size = $pageSize
   $tab2.Size = $pageSize
+  $tab3.Size = $pageSize
 
   $lv = New-Object Windows.Forms.ListView
   $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false
@@ -606,7 +700,7 @@ function Show-Gui {
       $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }))
       [void]$it.SubItems.Add($f.Type)
       [void]$it.SubItems.Add($(if ($f.RamMB -gt 0) { '{0} MB' -f $f.RamMB } else { '-' }))
-      [void]$it.SubItems.Add($(if ($f.Action -eq 'Kill') { 'close it now' } else { 'set to Manual (starts on demand)' }))
+      [void]$it.SubItems.Add($(if ($f.Action -eq 'Kill') { 'Close' } else { 'Set to Manual' }))
       $it.Tag = $f
       [void]$lv.Items.Add($it)
     }
@@ -702,7 +796,7 @@ function Show-Gui {
       return
     }
     $ans = [Windows.Forms.MessageBox]::Show(
-      "Version $($script:online.Version) is available (you have $Version).`r`n`r`nDownload it and restart Optimizer?",
+      "Version $($script:online.Version) is available (you have $Version).`r`n`r`nDownload it and restart TsakasOptimizer?",
       'Update available', 'YesNo', 'Question')
     if ($ans -ne 'Yes') { return }
     try {
@@ -719,12 +813,12 @@ function Show-Gui {
   $btnApply.Add_Click({
     $items = @($lv.CheckedItems)
     if ($items.Count -eq 0) {
-      [void][Windows.Forms.MessageBox]::Show('Tick at least one row first.', 'Optimizer')
+      [void][Windows.Forms.MessageBox]::Show('Tick at least one row first.', 'TsakasOptimizer')
       return
     }
     $names = ($items | ForEach-Object { $_.Tag.Label }) -join "`r`n"
     $ans = [Windows.Forms.MessageBox]::Show(
-      "Apply to these $($items.Count) item(s)?`r`n`r`n$names", 'Optimizer', 'YesNo', 'Question')
+      "Apply to these $($items.Count) item(s)?`r`n`r`n$names", 'TsakasOptimizer', 'YesNo', 'Question')
     if ($ans -ne 'Yes') { return }
 
     $freed = 0.0; $errs = @()
@@ -806,6 +900,66 @@ function Show-Gui {
   }
   & $loadMemory
 
+  # ---- Motherboard tab ----
+  $blv = New-Object Windows.Forms.ListView
+  $blv.View = 'Details'; $blv.FullRowSelect = $true
+  $blv.Location = New-Object Drawing.Point(12, 12)
+  $blv.Size = New-Object Drawing.Size(800, 190)
+  $blv.Anchor = 'Top,Left,Right'
+  $blv.BorderStyle = 'FixedSingle'
+  $blv.BackColor = [Drawing.Color]::White
+  foreach ($c in @(@('Part', 80), @('Device', 240), @('Provider', 150), @('Version', 110), @('Date', 80), @('Note', 270))) {
+    [void]$blv.Columns.Add($c[0], $c[1])
+  }
+  $tab3.Controls.Add($blv)
+
+  $btext = New-Object Windows.Forms.TextBox
+  $btext.Multiline = $true; $btext.ReadOnly = $true; $btext.ScrollBars = 'Vertical'
+  $btext.BackColor = 'Window'
+  $btext.Font = New-Object Drawing.Font('Consolas', 9)
+  $btext.Location = New-Object Drawing.Point(12, 212)
+  $btext.Size = New-Object Drawing.Size(800, 240)
+  $btext.Anchor = 'Top,Left,Right,Bottom'
+  $btext.BorderStyle = 'FixedSingle'
+  $tab3.Controls.Add($btext)
+
+  $btnBoard = New-Object Windows.Forms.Button
+  $btnBoard.Text = 'Open support page'
+  $btnBoard.Location = New-Object Drawing.Point(12, 462)
+  $btnBoard.Size = New-Object Drawing.Size(160, 30)
+  $btnBoard.Anchor = 'Bottom,Left'
+  & $flat $btnBoard $false
+  $tab3.Controls.Add($btnBoard)
+  $btnBoard.Add_Click({
+    $b = Get-BoardInfo
+    $q = [Uri]::EscapeDataString(("{0} {1} bios driver download" -f $b.Vendor, $b.Model))
+    Start-Process "https://www.google.com/search?q=$q"
+  })
+
+  $loadBoard = {
+    $blv.Items.Clear()
+    foreach ($d in @(Get-DriverInfo)) {
+      $it = New-Object Windows.Forms.ListViewItem($d.Category)
+      [void]$it.SubItems.Add($d.Device)
+      [void]$it.SubItems.Add($d.Provider)
+      [void]$it.SubItems.Add([string]$d.Version)
+      [void]$it.SubItems.Add($(if ($d.Date) { '{0:yyyy-MM}' -f $d.Date } else { '-' }))
+      [void]$it.SubItems.Add($d.Note)
+      [void]$blv.Items.Add($it)
+    }
+    $btext.Text = ((Get-BiosNotes (Get-BoardInfo)) -join "`r`n") + "`r`n`r`n" +
+      'Drivers: Windows Update carries chipset, network and audio drivers, but the vendor page is usually newer. Graphics drivers come from NVIDIA or AMD directly.'
+  }
+
+  # this tab costs about a second to build, so only do it when it is opened
+  $script:boardLoaded = $false
+  $tabs.Add_SelectedIndexChanged({
+    if ($tabs.SelectedTab -eq $tab3 -and -not $script:boardLoaded) {
+      $form.Cursor = 'WaitCursor'
+      try { & $loadBoard; $script:boardLoaded = $true } finally { $form.Cursor = 'Default' }
+    }
+  })
+
   # bottom-right of the tab page, once the real sizes exist
   $form.Add_Shown({
     $btnElev.Left = $tab1.ClientSize.Width - $btnElev.Width - 12
@@ -862,6 +1016,14 @@ function Invoke-SelfTest {
     @{N = 'a Windows service is never guessed';   R = ((Get-ServiceGuess ([pscustomobject]@{Name='SomeUpdateSvc';DisplayName='Some Update Service';PathName="$env:SystemRoot\system32\svchost.exe";State='Running'})).Score -eq 0)}
     @{N = 'audio/driver services are left alone'; R = ((Get-ServiceGuess ([pscustomobject]@{Name='RtkAudUService';DisplayName='Realtek Audio Universal Service';PathName='C:\Program Files\Realtek\x.exe';State='Running'})).Score -eq 0)}
     @{N = 'autostart name prefix match works';    R = (Test-AutoStarts 'Overwolf' (New-Object System.Collections.Generic.HashSet[string] ([string[]]@('OverwolfLauncher'), [StringComparer]::OrdinalIgnoreCase)))}
+    # motherboard tab
+    @{N = 'a 2 year old BIOS is flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-24);AgeMonths=24;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'over 18 months old'}
+    @{N = 'a recent BIOS is not flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'BIOS is recent'}
+    @{N = 'AM5 gets the AGESA note';              R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'AGESA'}
+    @{N = 'generic Microsoft driver is called out'; R = ((Get-DriverNote 'Microsoft' (Get-Date)) -match 'generic Windows driver')}
+    @{N = 'an old driver is called out';          R = ((Get-DriverNote 'Realtek' ((Get-Date).AddYears(-4))) -match 'over 3 years old')}
+    @{N = 'a current vendor driver is silent';    R = ((Get-DriverNote 'Realtek' (Get-Date)) -eq '')}
+    @{N = 'board info reads without error';       R = ((Get-BoardInfo).Model -ne $null)}
     @{N = 'G.Skill part number gives CL30-38';    R = (((Get-PartTimings 'F5-6000J3038F16G').CL -eq 30) -and ((Get-PartTimings 'F5-6000J3038F16G').tRCD -eq 38))}
     @{N = 'Corsair part number gives CL36';       R = ((Get-PartTimings 'CMK32GX5M2B6000C36').CL -eq 36)}
     @{N = 'unknown part number gives no CL';      R = ($null -eq (Get-PartTimings 'NO-SUCH-PART').CL)}
@@ -882,7 +1044,7 @@ if ($Undo)     { Invoke-Undo;     return }
 if (-not $Console -and -not $Report) { Show-Gui; return }
 
 Write-Host ''
-Write-Host '  Optimizer - scanning processes and auto-start services...' -ForegroundColor Cyan
+Write-Host '  TsakasOptimizer - scanning processes and auto-start services...' -ForegroundColor Cyan
 if (-not (Test-Admin)) { Write-Host '  (not running as Administrator - service changes will be skipped)' -ForegroundColor Yellow }
 Write-Host ''
 
@@ -921,6 +1083,6 @@ Write-Host ''
 if ($Report) {
   Write-Host ("  {0} item(s) flagged. Run without -Report to act on them." -f $findings.Count) -ForegroundColor Cyan
 } else {
-  Write-Host ("  Done. Freed about {0} MB. Undo service changes with: .\Optimizer.ps1 -Undo" -f [math]::Round($freed,1)) -ForegroundColor Cyan
+  Write-Host ("  Done. Freed about {0} MB. Undo service changes with: .\TsakasOptimizer.ps1 -Undo" -f [math]::Round($freed,1)) -ForegroundColor Cyan
 }
 Write-Host ''

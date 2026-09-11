@@ -1,6 +1,6 @@
 #requires -Version 5.1
 <#
-  Installs Optimizer to %LOCALAPPDATA%\Optimizer and adds Start Menu and desktop
+  Installs TsakasOptimizer to %LOCALAPPDATA%\TsakasOptimizer and adds Start Menu and desktop
   shortcuts. No admin rights needed. Run it again to reinstall or repair.
 
     irm https://raw.githubusercontent.com/TsakasOptimizations/Optimizer/main/install.ps1 | iex
@@ -8,12 +8,12 @@
 $ErrorActionPreference = 'Stop'
 
 $Repo   = 'TsakasOptimizations/Optimizer'
-$RawUrl = "https://raw.githubusercontent.com/$Repo/main/Optimizer.ps1"
-$Dir    = Join-Path $env:LOCALAPPDATA 'Optimizer'
-$Script = Join-Path $Dir 'Optimizer.ps1'
+$RawUrl = "https://raw.githubusercontent.com/$Repo/main/TsakasOptimizer.ps1"
+$Dir    = Join-Path $env:LOCALAPPDATA 'TsakasOptimizer'
+$Script = Join-Path $Dir 'TsakasOptimizer.ps1'
 
 Write-Host ''
-Write-Host '  Installing Optimizer...' -ForegroundColor Cyan
+Write-Host '  Installing TsakasOptimizer...' -ForegroundColor Cyan
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $text = (Invoke-WebRequest -Uri $RawUrl -UseBasicParsing -TimeoutSec 20).Content
@@ -29,8 +29,8 @@ $version = if ($text -match "(?m)^\s*\`$Version\s*=\s*'([\d.]+)'") { $Matches[1]
 $shell = New-Object -ComObject WScript.Shell
 $ps    = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $links = @(
-  (Join-Path ([Environment]::GetFolderPath('Programs')) 'Optimizer.lnk')
-  (Join-Path ([Environment]::GetFolderPath('Desktop'))  'Optimizer.lnk')
+  (Join-Path ([Environment]::GetFolderPath('Programs')) 'TsakasOptimizer.lnk')
+  (Join-Path ([Environment]::GetFolderPath('Desktop'))  'TsakasOptimizer.lnk')
 )
 foreach ($lnk in $links) {
   $s = $shell.CreateShortcut($lnk)
