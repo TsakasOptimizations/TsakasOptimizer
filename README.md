@@ -2,39 +2,48 @@
 
 A single PowerShell script that looks at what is running on a Windows PC, points
 out what is safe to close or set to Manual, and asks before changing anything.
-No installer, no dependencies, no telemetry.
+One file, no dependencies, no telemetry, no admin rights to install.
 
-## Run it
+## Install
 
-One line, nothing to download, always the current version:
+One line in any PowerShell window. No admin rights, nothing to unzip:
 
 ```
-irm https://raw.githubusercontent.com/TsakasOptimizations/Optimizer/main/Optimizer.ps1 | iex
+irm https://raw.githubusercontent.com/TsakasOptimizations/Optimizer/main/install.ps1 | iex
 ```
 
-Paste that into any PowerShell window and the app opens. Execution policy does
-not apply, because nothing is saved to disk.
+That installs Optimizer to `%LOCALAPPDATA%\Optimizer`, adds a Start Menu and a
+desktop shortcut, and opens it. It stays on the PC - launch it any time from the
+Start Menu. To update later, open it and press `Check for updates`.
 
-To keep a copy instead, download the folder and double-click `Optimizer.cmd`. It
-works from anywhere, because it resolves its own folder.
+Run the same line again to reinstall or repair.
 
-From a terminal, either cd into the folder first:
+### Run it as administrator
+
+Service changes need admin rights. The window has a button that restarts it
+elevated, or right-click the shortcut and choose Run as administrator.
+
+### Without installing
+
+Download the folder and double-click `Optimizer.cmd`, which resolves its own
+folder and works from anywhere. From a terminal, cd into the folder first:
 
 ```
 cd C:\path\to\Optimizer
 powershell -ExecutionPolicy Bypass -File .\Optimizer.ps1
 ```
 
-or give the full path, which works from any directory:
-
-```
-powershell -ExecutionPolicy Bypass -File "C:\path\to\Optimizer\Optimizer.ps1"
-```
-
 If Windows blocks the download, right-click the file, Properties, tick Unblock.
 
-Run it as administrator if you want service changes to apply - the window has a
-button that restarts it elevated.
+### Uninstall
+
+```
+Remove-Item "$env:LOCALAPPDATA\Optimizer" -Recurse -Force
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Optimizer.lnk", "$env:USERPROFILE\Desktop\Optimizer.lnk" -Force
+```
+
+Services you set to Manual stay that way - press Undo in the app before removing
+it if you want them back on Automatic.
 
 ## What it looks at
 
@@ -73,10 +82,10 @@ SPD/rated profile. Verify the loaded values in BIOS, ZenTimings or CPU-Z.
 
 ## Updates
 
-`Check for updates` compares the `$Version` line in this script against the copy
-published at `$RawUrl`, and a blue dot appears when a newer one exists. If you
-started it with the one-liner above there is nothing to update - you already
-fetched the latest copy.
+`Check for updates` compares the `$Version` line in the installed script against
+the copy published at `$RawUrl`. A blue dot appears when a newer one exists;
+accepting it backs the current file up as `Optimizer.ps1.bak`, writes the new
+version and restarts.
 
 To publish your own build, set `$Repo` at the top of `Optimizer.ps1` to your
 repo (`owner/name`), then bump `$Version` with every release.
