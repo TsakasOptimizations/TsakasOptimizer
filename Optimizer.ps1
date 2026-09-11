@@ -611,6 +611,12 @@ function Show-Gui {
   $timer.Start()
 
   $btnUpdate.Add_Click({
+    if ($Repo -like 'CHANGEME/*') {
+      [void][Windows.Forms.MessageBox]::Show(
+        "Updates are not set up in this build. Set `$Repo at the top of Optimizer.ps1 to your GitHub repo.",
+        'Updates not configured', 'OK', 'Information')
+      return
+    }
     $btnUpdate.Enabled = $false
     $form.Cursor = 'WaitCursor'
     try { $script:online = Get-OnlineRelease } finally { $form.Cursor = 'Default'; $btnUpdate.Enabled = $true }
