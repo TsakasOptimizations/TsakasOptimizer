@@ -7,12 +7,12 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.0.1'
+$Version = '1.0.2'
 $Repo    = 'TsakasOptimizations/Optimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/Optimizer.ps1"
 
-$Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$Root = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $env:LOCALAPPDATA 'Optimizer' }
 $UndoFile = Join-Path $Root 'optimizer-undo.json'
 
 # --- updates -----------------------------------------------------------------
@@ -246,6 +246,8 @@ function Test-Admin {
 }
 
 function Add-UndoEntry($Entry) {
+  $dir = Split-Path $UndoFile
+  if (-not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
   $log = @()
   if (Test-Path $UndoFile) { $log = @(Get-Content $UndoFile -Raw | ConvertFrom-Json) }
   $log += $Entry
@@ -678,6 +680,12 @@ function Show-Gui {
   $timer.Start()
 
   $btnUpdate.Add_Click({
+    if (-not $scriptPath) {
+      [void][Windows.Forms.MessageBox]::Show(
+        "You launched this straight from GitHub, so you are already on the latest version ($Version).",
+        'Up to date', 'OK', 'Information')
+      return
+    }
     $btnUpdate.Enabled = $false
     $form.Cursor = 'WaitCursor'
     try { $script:online = Get-OnlineRelease } finally { $form.Cursor = 'Default'; $btnUpdate.Enabled = $true }

@@ -6,8 +6,17 @@ No installer, no dependencies, no telemetry.
 
 ## Run it
 
-Download the folder and double-click `Optimizer.cmd`. It works from anywhere,
-because it resolves its own folder.
+One line, nothing to download, always the current version:
+
+```
+irm https://raw.githubusercontent.com/TsakasOptimizations/Optimizer/main/Optimizer.ps1 | iex
+```
+
+Paste that into any PowerShell window and the app opens. Execution policy does
+not apply, because nothing is saved to disk.
+
+To keep a copy instead, download the folder and double-click `Optimizer.cmd`. It
+works from anywhere, because it resolves its own folder.
 
 From a terminal, either cd into the folder first:
 
@@ -65,7 +74,9 @@ SPD/rated profile. Verify the loaded values in BIOS, ZenTimings or CPU-Z.
 ## Updates
 
 `Check for updates` compares the `$Version` line in this script against the copy
-published at `$RawUrl`, and a blue dot appears when a newer one exists.
+published at `$RawUrl`, and a blue dot appears when a newer one exists. If you
+started it with the one-liner above there is nothing to update - you already
+fetched the latest copy.
 
 To publish your own build, set `$Repo` at the top of `Optimizer.ps1` to your
 repo (`owner/name`), then bump `$Version` with every release.
