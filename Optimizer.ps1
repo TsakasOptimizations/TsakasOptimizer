@@ -8,7 +8,7 @@
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
 $Version = '1.0.0'
-$Repo    = 'CHANGEME/Optimizer'    # <- your GitHub repo, as owner/name
+$Repo    = 'TsakasIoannis/Optimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/Optimizer.ps1"
 
@@ -16,9 +16,8 @@ $Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $UndoFile = Join-Path $Root 'optimizer-undo.json'
 
 # --- updates -----------------------------------------------------------------
-# The published copy of this script is the manifest: read its $Version line.
+# The published script is the manifest: read its $Version line.
 function Get-OnlineRelease {
-  if ($Repo -like 'CHANGEME/*') { return $null }
   try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $text = (Invoke-WebRequest -Uri $RawUrl -UseBasicParsing -TimeoutSec 8).Content
@@ -140,18 +139,14 @@ $Catalog = @(
 ) | ForEach-Object { [pscustomobject]$_ }
 
 # --- scoring unknown stuff ---------------------------------------------------
-# The catalog only knows what someone typed into it. Everything else gets judged
-# on behaviour instead: does it start itself, does it have a window, does it look
-# like a helper/updater, is it big. Scores are shown as "Guess" and never
-# pre-ticked - they are an opinion, not a verdict.
+# Anything the catalog misses is scored on behaviour: autostart, window, name, size.
 $BloatWords = 'updat|upgrad|telemetr|helper|agent|crash|report|tray|notif|daemon|launcher|overlay|assist|booster|cleaner|doctor|toolbar|companion|widget|analytic'
 
-# things nobody should be talked into disabling by a heuristic
+# never scored - too risky to disable on a heuristic
 $NeverGuess = 'defender|antivir|antimalware|security|firewall|vpn|backup|bitlocker|encrypt|audio|realtek|nvidia|amd |intel\(r\)|driver|bluetooth|network|storage|raid|nvme|hyper-v|vmware|virtualbox|wsl'
 
 function Get-AutoStartNames {
-  # Enumerating scheduled tasks costs ~0.7s, and startup entries do not change
-  # while the window is open, so read them once per run.
+  # Get-ScheduledTask costs ~0.7s; startup entries cannot change mid-run, so read once.
   if ($script:AutoNames) { return $script:AutoNames }
   $set = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
   $add = { param($text) foreach ($m in [regex]::Matches([string]$text, '([^\\/":\s]+)\.exe')) { [void]$set.Add($m.Groups[1].Value) } }
@@ -166,7 +161,7 @@ function Get-AutoStartNames {
   foreach ($d in @([Environment]::GetFolderPath('Startup'), [Environment]::GetFolderPath('CommonStartup'))) {
     foreach ($f in (Get-ChildItem $d -File -ErrorAction SilentlyContinue)) { [void]$set.Add($f.BaseName) }
   }
-  # tasks that fire at logon or boot are the third way an app starts itself
+  # tasks that run at logon or boot
   foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue)) {
     $trig = $t.Triggers.CimClass.CimClassName
     if ($trig -notcontains 'MSFT_TaskLogonTrigger' -and $trig -notcontains 'MSFT_TaskBootTrigger') { continue }
@@ -290,7 +285,7 @@ function Get-Findings {
       continue
     }
 
-    # not in the catalog - judge it on behaviour
+    # not in the catalog - score it
     $first = $g.Group[0]
     $path = try { $first.Path } catch { '' }
     if (-not $path) { continue }                       # cannot inspect it, so do not guess
@@ -368,9 +363,8 @@ function Invoke-Finding($f) {
 }
 
 # --- memory ------------------------------------------------------------------
-# Slot naming is board-specific (DIMM 0/1, DIMM_A1, ChannelA-DIMM1...).
-# These two parsers cover the common spellings; the raw locator is always shown
-# so it can be checked against the motherboard manual.
+# Slot naming is board-specific (DIMM 0/1, DIMM_A1, ChannelA-DIMM1...). The raw
+# locator is always shown so it can be checked against the motherboard manual.
 function Get-DimmChannel([string]$Bank, [string]$Locator) {
   if ($Bank -match '(?i)channel\s*([A-D])')    { return $Matches[1].ToUpper() }
   if ($Locator -match '(?i)([A-D])\s*\d')      { return $Matches[1].ToUpper() }
@@ -549,8 +543,7 @@ function Show-Gui {
   foreach ($t in @($tab1, $tab2)) { $t.BackColor = [Drawing.Color]::White; $t.UseVisualStyleBackColor = $false }
   $tabs.TabPages.AddRange(@($tab1, $tab2))
   $form.Controls.Add($tabs)
-  # a TabPage defaults to 200x100; anchored children are laid out against whatever
-  # size the page has when they are added, so give it the real size first
+  # a TabPage defaults to 200x100; set the real size before adding anchored children
   $pageSize = New-Object Drawing.Size($tabs.DisplayRectangle.Width, $tabs.DisplayRectangle.Height)
   $tab1.Size = $pageSize
   $tab2.Size = $pageSize
@@ -583,7 +576,7 @@ function Show-Gui {
   & $flat $btnUpdate $false
   $footer.Controls.Add($btnUpdate)
 
-  # blue dot = the script file on disk is newer than the copy this window is running
+  # blue dot = a newer version is published online
   $dot = New-Object Windows.Forms.Label
   $dot.Text = [char]0x25CF
   $dot.Font = New-Object Drawing.Font('Segoe UI', 14)
@@ -600,7 +593,7 @@ function Show-Gui {
   $scriptPath = $PSCommandPath
   $online = $null
 
-  # one quiet check shortly after the window opens, so startup is not blocked
+  # check after the window is up, so startup is not blocked
   $timer = New-Object Windows.Forms.Timer
   $timer.Interval = 1500
   $timer.Add_Tick({
@@ -611,12 +604,6 @@ function Show-Gui {
   $timer.Start()
 
   $btnUpdate.Add_Click({
-    if ($Repo -like 'CHANGEME/*') {
-      [void][Windows.Forms.MessageBox]::Show(
-        "Updates are not set up in this build. Set `$Repo at the top of Optimizer.ps1 to your GitHub repo.",
-        'Updates not configured', 'OK', 'Information')
-      return
-    }
     $btnUpdate.Enabled = $false
     $form.Cursor = 'WaitCursor'
     try { $script:online = Get-OnlineRelease } finally { $form.Cursor = 'Default'; $btnUpdate.Enabled = $true }
@@ -737,7 +724,7 @@ function Show-Gui {
   }
   & $loadMemory
 
-  # put the admin button in the bottom-right of its tab page, once sizes are real
+  # bottom-right of the tab page, once the real sizes exist
   $form.Add_Shown({
     $btnElev.Left = $tab1.ClientSize.Width - $btnElev.Width - 12
     $btnElev.Top  = $tab1.ClientSize.Height - $btnElev.Height - 12
@@ -761,7 +748,7 @@ function Invoke-SelfTest {
     @{N = 'scan returns objects, not errors'; R = ((@(Get-Findings) | Where-Object { $_ -isnot [pscustomobject] }).Count -eq 0)}
   )
 
-  # memory tab logic, checked against fake sticks so it does not depend on this PC
+  # fake sticks, so these do not depend on this PC
   $fake = {
     param($ch, $slot, $rated, $run, $part)
     [pscustomobject]@{ Channel=$ch; Slot=$slot; Locator="CHANNEL $ch / DIMM $($slot-1)"; GB=16; Type='DDR5'
@@ -782,7 +769,7 @@ function Invoke-SelfTest {
     @{N = 'sticks in A1/B1 are flagged';          R = ((Get-MemoryNotes $slot13 4 $cpu) -join "`n") -match 'FIRST slot'}
     @{N = 'both sticks one channel is flagged';   R = ((Get-MemoryNotes $oneCh 4 $cpu) -join "`n") -match 'same channel'}
     @{N = 'AM5 target advice appears';            R = ((Get-MemoryNotes $good 4 $cpu) -join "`n") -match 'DDR5-6000 CL30'}
-    # behaviour scoring for things the catalog has never heard of
+    # behaviour scoring
     @{N = 'background autostart is flagged';      R = ((Get-ProcessGuess ([pscustomobject]@{Name='Overwolf';HasWindow=$false;RamMB=190;Company='Overwolf LTD';AutoStart=$true;BootMinutes=0.3})).Score -ge 5)}
     @{N = 'an app you have open is not flagged';  R = ((Get-ProcessGuess ([pscustomobject]@{Name='krita';HasWindow=$true;RamMB=900;Company='KDE';AutoStart=$false;BootMinutes=40})).Score -lt 5)}
     @{N = 'a quiet background tool is not flagged'; R = ((Get-ProcessGuess ([pscustomobject]@{Name='krita';HasWindow=$false;RamMB=40;Company='KDE';AutoStart=$false;BootMinutes=40})).Score -lt 5)}
