@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.0.0'
+$Version = '1.0.1'
 $Repo    = 'TsakasOptimizations/Optimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/Optimizer.ps1"
@@ -548,6 +548,80 @@ function Show-Gui {
   $tab1.Size = $pageSize
   $tab2.Size = $pageSize
 
+  $lv = New-Object Windows.Forms.ListView
+  $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false
+  $lv.Location = New-Object Drawing.Point(12, 12)
+  $lv.Size = New-Object Drawing.Size(800, 330)
+  $lv.Anchor = 'Top,Left,Right,Bottom'
+  $lv.BorderStyle = 'FixedSingle'
+  $lv.BackColor = [Drawing.Color]::White
+  [void]$lv.Columns.Add('App Name', 330)
+  [void]$lv.Columns.Add('Type', 70)
+  [void]$lv.Columns.Add('RAM', 90)
+  [void]$lv.Columns.Add('Suggested', 290)
+  $tab1.Controls.Add($lv)
+
+  $details = New-Object Windows.Forms.TextBox
+  $details.Multiline = $true; $details.ReadOnly = $true; $details.BackColor = 'Window'
+  $details.Location = New-Object Drawing.Point(12, 352)
+  $details.Size = New-Object Drawing.Size(800, 56)
+  $details.Anchor = 'Left,Right,Bottom'
+  $details.BorderStyle = 'FixedSingle'
+  $details.ForeColor = $muted
+  $details.Text = 'Scans the processes your CPU/PC runs. Suggests putting services on Manual instead of Automatic and closing unnessecary apps. Tick what you want changed, then press Apply.'
+  $tab1.Controls.Add($details)
+
+  $status = New-Object Windows.Forms.Label
+  $status.Location = New-Object Drawing.Point(12, 418)
+  $status.Size = New-Object Drawing.Size(800, 40)
+  $status.Anchor = 'Left,Right,Bottom'
+  $status.ForeColor = $muted
+  $tab1.Controls.Add($status)
+
+  $mkButton = {
+    param($text, $x, $w)
+    $b = New-Object Windows.Forms.Button
+    $b.Text = $text
+    $b.Location = New-Object Drawing.Point($x, 462)
+    $b.Size = New-Object Drawing.Size($w, 30)
+    $b.Anchor = 'Left,Bottom'
+    & $flat $b $false
+    $tab1.Controls.Add($b)
+    $b
+  }
+  $btnApply   = & $mkButton 'Apply selected' 12  130
+  $btnRefresh = & $mkButton 'Rescan'         150 90
+  $btnUndo    = & $mkButton 'Undo changes'   248 110
+  $btnElev    = & $mkButton 'Restart app as admin' 366 160
+  & $flat $btnApply $true
+  $btnElev.Visible = -not (Test-Admin)
+  $btnElev.Anchor = 'Bottom,Right'
+  $btnElev.Location = New-Object Drawing.Point(($form.ClientSize.Width - $btnElev.Width - 12), 462)
+
+  $refresh = {
+    $lv.Items.Clear()
+    foreach ($f in @(Get-Findings)) {
+      $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }))
+      [void]$it.SubItems.Add($f.Type)
+      [void]$it.SubItems.Add($(if ($f.RamMB -gt 0) { '{0} MB' -f $f.RamMB } else { '-' }))
+      [void]$it.SubItems.Add($(if ($f.Action -eq 'Kill') { 'close it now' } else { 'set to Manual (starts on demand)' }))
+      $it.Tag = $f
+      [void]$lv.Items.Add($it)
+    }
+    $status.Text = "{0} item(s) found.{1}" -f $lv.Items.Count,
+      $(if (Test-Admin) { '' } else { '  Not running as administrator - service changes will be skipped.' })
+  }
+  & $refresh
+
+  $lv.Add_ItemSelectionChanged({
+    if ($lv.SelectedItems.Count -gt 0) {
+      $f = $lv.SelectedItems[0].Tag
+      $details.Text = "{0}`r`n{1}" -f $f.Why,
+        $(if ($f.Action -eq 'Kill') { 'Closing it now. It starts again next time you open the app.' }
+          else { 'Start type becomes Manual: Windows starts it only when something asks for it. Reversible with Undo.' })
+    }
+  })
+
   # ---- footer: contact on the left, update check on the right ----
   $footer = New-Object Windows.Forms.Panel
   $footer.Location = New-Object Drawing.Point(0, 536)
@@ -588,7 +662,7 @@ function Show-Gui {
   $footer.Controls.Add($dot)
 
   $tip = New-Object Windows.Forms.ToolTip
-  $tip.SetToolTip($dot, 'A newer version of Optimizer.ps1 is on disk - click Check for updates to load it.')
+  $tip.SetToolTip($dot, 'A newer version is available - click Check for updates.')
 
   $scriptPath = $PSCommandPath
   $online = $null
