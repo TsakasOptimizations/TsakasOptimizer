@@ -8,7 +8,7 @@
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
 $Version = '1.0.0'
-$Repo    = 'TsakasIoannis/Optimizer'
+$Repo    = 'TsakasOptimizations/Optimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/Optimizer.ps1"
 
