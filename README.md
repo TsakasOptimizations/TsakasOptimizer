@@ -6,11 +6,23 @@ No installer, no dependencies, no telemetry.
 
 ## Run it
 
-Download the folder and double-click `Optimizer.cmd`, or:
+Download the folder and double-click `Optimizer.cmd`. It works from anywhere,
+because it resolves its own folder.
+
+From a terminal, either cd into the folder first:
 
 ```
+cd C:\path\to\Optimizer
 powershell -ExecutionPolicy Bypass -File .\Optimizer.ps1
 ```
+
+or give the full path, which works from any directory:
+
+```
+powershell -ExecutionPolicy Bypass -File "C:\path\to\Optimizer\Optimizer.ps1"
+```
+
+If Windows blocks the download, right-click the file, Properties, tick Unblock.
 
 Run it as administrator if you want service changes to apply - the window has a
 button that restarts it elevated.
