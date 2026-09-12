@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.1.0'
+$Version = '1.2.0'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -259,7 +259,17 @@ function Invoke-Undo {
   if (-not (Test-Admin)) { Write-Host 'Run as Administrator to restore services.' -ForegroundColor Yellow; return }
   foreach ($e in @(Get-Content $UndoFile -Raw | ConvertFrom-Json)) {
     try {
-      Set-Service -Name $e.Name -StartupType $e.Previous
+      switch ($e.Type) {
+        'NetProperty' {
+          Set-NetAdapterAdvancedProperty -Name $e.Adapter -DisplayName $e.Name -DisplayValue $e.Previous -ErrorAction Stop
+        }
+        'NetPower' {
+          $pm = Get-NetAdapterPowerManagement -Name $e.Adapter -ErrorAction Stop
+          $pm.AllowComputerToTurnOffDevice = $e.Previous
+          Set-NetAdapterPowerManagement -InputObject $pm -ErrorAction Stop
+        }
+        default { Set-Service -Name $e.Name -StartupType $e.Previous }
+      }
       Write-Host ("restored {0} -> {1}" -f $e.Name, $e.Previous) -ForegroundColor Green
     } catch {
       Write-Host ("could not restore {0}: {1}" -f $e.Name, $_.Exception.Message) -ForegroundColor Red
@@ -592,6 +602,93 @@ function Get-DriverNote([string]$Provider, $Date) {
   $notes -join '; '
 }
 
+# --- network adapters --------------------------------------------------------
+# Link power saving buys a fraction of a watt and costs latency spikes and the
+# occasional dropped link. Worth turning off on a desktop, pointless on a laptop
+# running from battery.
+$NetPowerProps = 'Energy.Efficient|Advanced EEE|Green Ethernet|Gigabit Lite|Power Saving|Selective Suspend|Ultra Low Power|Idle Power|Reduce Speed|Auto Disable|Energy Detect'
+
+$NetWhy = @{
+  'Energy-Efficient Ethernet' = 'Powers the link down between packets. Saves under a watt, and is a known cause of latency spikes and dropped links.'
+  'Advanced EEE'              = 'Aggressive version of the same link power saving. Same trade, worse.'
+  'Green Ethernet'            = 'Cuts transmit power based on cable length. Can cause renegotiation on marginal cables.'
+  'Gigabit Lite'              = 'Runs the link in a lower-power mode. Can drop you to a slower speed.'
+  'Power Saving Mode'         = 'Vendor power saving for the adapter. Trades latency for a trivial amount of power.'
+  'Selective Suspend'         = 'Lets Windows suspend the adapter when idle. It wakes late, so the first packet after a pause is slow.'
+}
+
+# Returns the value to set it to, or $null when the property is not a simple
+# on/off switch or is already off.
+function Get-NetOffValue([string]$DisplayName, [string]$Current, $ValidValues) {
+  if ($DisplayName -notmatch $NetPowerProps) { return $null }
+  $off = @($ValidValues) | Where-Object { $_ -match '^\s*(Disabled|Off)\s*$' } | Select-Object -First 1
+  if (-not $off) { return $null }                          # e.g. "EEE Max Support Speed" is a speed list
+  if ($Current -match '^\s*(Disabled|Off)\s*$') { return $null }
+  return $off
+}
+
+function Get-NetFindings {
+  $rows = New-Object System.Collections.ArrayList
+  foreach ($a in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Not Present' })) {
+    foreach ($p in @(Get-NetAdapterAdvancedProperty -Name $a.Name -ErrorAction SilentlyContinue)) {
+      $off = Get-NetOffValue $p.DisplayName $p.DisplayValue $p.ValidDisplayValues
+      if (-not $off) { continue }
+      $why = $NetWhy[$p.DisplayName]
+      if (-not $why) { $why = 'Adapter power saving. Turning it off keeps the link up and responsive.' }
+      [void]$rows.Add([pscustomobject]@{
+        Kind = 'Property'; Adapter = $a.Name; Setting = $p.DisplayName
+        Current = $p.DisplayValue; Target = $off; Why = $why
+      })
+    }
+    $pm = try { Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction Stop } catch { $null }
+    if ($pm -and $pm.AllowComputerToTurnOffDevice -eq 'Enabled') {
+      [void]$rows.Add([pscustomobject]@{
+        Kind = 'Power'; Adapter = $a.Name; Setting = 'Allow the computer to turn off this device'
+        Current = 'Enabled'; Target = 'Disabled'
+        Why = 'Windows may power the adapter down to save energy. This is the classic cause of "the internet drops after the PC has been idle".'
+      })
+    }
+  }
+  $rows
+}
+
+function Get-NetNotes {
+  $n = New-Object System.Collections.ArrayList
+  foreach ($a in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Not Present' })) {
+    [void]$n.Add(("{0}: {1}, link {2}, {3}" -f $a.Name, $a.InterfaceDescription, $a.LinkSpeed, $a.Status))
+
+    $speeds = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Speed & Duplex' -ErrorAction SilentlyContinue).ValidDisplayValues
+    if ($speeds -and ($speeds -match '2\.5 Gbps') -and $a.LinkSpeed -like '1 Gbps*') {
+      [void]$n.Add('    [i] The adapter supports 2.5 Gbps but negotiated 1 Gbps. That is the switch or the cable, not a setting - you need a 2.5G port and cat5e or better.')
+    }
+    $pm = try { Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction Stop } catch { $null }
+    if (-not $pm) {
+      [void]$n.Add('    [i] Windows could not read this adapter power settings (some Realtek drivers refuse). Check them by hand: Device Manager, the adapter, Power Management tab.')
+    }
+  }
+  [void]$n.Add('')
+  [void]$n.Add('Applying a change briefly resets the adapter, so the connection drops for a second or two. Do not do it mid-download, and never over a remote desktop session you cannot afford to lose.')
+  [void]$n.Add('On a laptop running from battery, leave these alone - that is what they are for.')
+  return $n
+}
+
+function Invoke-NetFix($Row) {
+  if (-not (Test-Admin)) { throw 'needs Administrator' }
+  if ($Row.Kind -eq 'Property') {
+    Add-UndoEntry ([pscustomobject]@{
+      Type = 'NetProperty'; Adapter = $Row.Adapter; Name = $Row.Setting
+      Previous = $Row.Current; When = (Get-Date).ToString('s') })
+    Set-NetAdapterAdvancedProperty -Name $Row.Adapter -DisplayName $Row.Setting -DisplayValue $Row.Target -ErrorAction Stop
+  } else {
+    Add-UndoEntry ([pscustomobject]@{
+      Type = 'NetPower'; Adapter = $Row.Adapter; Name = 'AllowComputerToTurnOffDevice'
+      Previous = $Row.Current; When = (Get-Date).ToString('s') })
+    $pm = Get-NetAdapterPowerManagement -Name $Row.Adapter -ErrorAction Stop
+    $pm.AllowComputerToTurnOffDevice = 'Disabled'
+    Set-NetAdapterPowerManagement -InputObject $pm -ErrorAction Stop
+  }
+}
+
 # --- gui ---------------------------------------------------------------------
 function Show-Gui {
   Add-Type -AssemblyName System.Windows.Forms
@@ -635,14 +732,16 @@ function Show-Gui {
   $tab1 = New-Object Windows.Forms.TabPage; $tab1.Text = 'Processes and services'
   $tab2 = New-Object Windows.Forms.TabPage; $tab2.Text = 'Memory'
   $tab3 = New-Object Windows.Forms.TabPage; $tab3.Text = 'Motherboard'
-  foreach ($t in @($tab1, $tab2, $tab3)) { $t.BackColor = [Drawing.Color]::White; $t.UseVisualStyleBackColor = $false }
-  $tabs.TabPages.AddRange(@($tab1, $tab2, $tab3))
+  $tab4 = New-Object Windows.Forms.TabPage; $tab4.Text = 'Network'
+  foreach ($t in @($tab1, $tab2, $tab3, $tab4)) { $t.BackColor = [Drawing.Color]::White; $t.UseVisualStyleBackColor = $false }
+  $tabs.TabPages.AddRange(@($tab1, $tab2, $tab3, $tab4))
   $form.Controls.Add($tabs)
   # a TabPage defaults to 200x100; set the real size before adding anchored children
   $pageSize = New-Object Drawing.Size($tabs.DisplayRectangle.Width, $tabs.DisplayRectangle.Height)
   $tab1.Size = $pageSize
   $tab2.Size = $pageSize
   $tab3.Size = $pageSize
+  $tab4.Size = $pageSize
 
   $lv = New-Object Windows.Forms.ListView
   $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false
@@ -953,11 +1052,89 @@ function Show-Gui {
 
   # this tab costs about a second to build, so only do it when it is opened
   $script:boardLoaded = $false
+  $script:netLoaded = $false
   $tabs.Add_SelectedIndexChanged({
-    if ($tabs.SelectedTab -eq $tab3 -and -not $script:boardLoaded) {
-      $form.Cursor = 'WaitCursor'
-      try { & $loadBoard; $script:boardLoaded = $true } finally { $form.Cursor = 'Default' }
+    $form.Cursor = 'WaitCursor'
+    try {
+      if ($tabs.SelectedTab -eq $tab3 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true }
+      if ($tabs.SelectedTab -eq $tab4 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true }
+    } finally { $form.Cursor = 'Default' }
+  })
+
+  # ---- Network tab ----
+  $nlv = New-Object Windows.Forms.ListView
+  $nlv.View = 'Details'; $nlv.CheckBoxes = $true; $nlv.FullRowSelect = $true; $nlv.HideSelection = $false
+  $nlv.Location = New-Object Drawing.Point(12, 12)
+  $nlv.Size = New-Object Drawing.Size(800, 190)
+  $nlv.Anchor = 'Top,Left,Right'
+  $nlv.BorderStyle = 'FixedSingle'
+  $nlv.BackColor = [Drawing.Color]::White
+  foreach ($c in @(@('Adapter', 120), @('Setting', 280), @('Now', 100), @('Change to', 100), @('', 180))) {
+    [void]$nlv.Columns.Add($c[0], $c[1])
+  }
+  $tab4.Controls.Add($nlv)
+
+  $ntext = New-Object Windows.Forms.TextBox
+  $ntext.Multiline = $true; $ntext.ReadOnly = $true; $ntext.ScrollBars = 'Vertical'
+  $ntext.BackColor = 'Window'
+  $ntext.Font = New-Object Drawing.Font('Consolas', 9)
+  $ntext.Location = New-Object Drawing.Point(12, 212)
+  $ntext.Size = New-Object Drawing.Size(800, 240)
+  $ntext.Anchor = 'Top,Left,Right,Bottom'
+  $ntext.BorderStyle = 'FixedSingle'
+  $tab4.Controls.Add($ntext)
+
+  $btnNet = New-Object Windows.Forms.Button
+  $btnNet.Text = 'Apply selected'
+  $btnNet.Location = New-Object Drawing.Point(12, 462)
+  $btnNet.Size = New-Object Drawing.Size(130, 30)
+  $btnNet.Anchor = 'Bottom,Left'
+  & $flat $btnNet $true
+  $tab4.Controls.Add($btnNet)
+
+  $loadNet = {
+    $nlv.Items.Clear()
+    foreach ($r in @(Get-NetFindings)) {
+      $it = New-Object Windows.Forms.ListViewItem($r.Adapter)
+      [void]$it.SubItems.Add($r.Setting)
+      [void]$it.SubItems.Add($r.Current)
+      [void]$it.SubItems.Add($r.Target)
+      [void]$it.SubItems.Add('')
+      $it.Tag = $r
+      [void]$nlv.Items.Add($it)
     }
+    $head = if ($nlv.Items.Count -eq 0) {
+      'Nothing to change - every power saving setting this tool checks is already off.'
+    } else {
+      "{0} setting(s) worth turning off. Tick and press Apply.{1}" -f $nlv.Items.Count,
+        $(if (Test-Admin) { '' } else { '  Needs administrator - use the button on the first tab.' })
+    }
+    $ntext.Text = $head + "`r`n`r`n" + ((Get-NetNotes) -join "`r`n")
+  }
+
+  $nlv.Add_ItemSelectionChanged({
+    if ($nlv.SelectedItems.Count -gt 0) { $ntext.Text = $nlv.SelectedItems[0].Tag.Why + "`r`n`r`n" + $ntext.Text.Substring($ntext.Text.IndexOf("`r`n`r`n") + 4) }
+  })
+
+  $btnNet.Add_Click({
+    $items = @($nlv.CheckedItems)
+    if ($items.Count -eq 0) {
+      [void][Windows.Forms.MessageBox]::Show('Tick at least one row first.', 'TsakasOptimizer')
+      return
+    }
+    $names = ($items | ForEach-Object { "{0}: {1}" -f $_.Tag.Adapter, $_.Tag.Setting }) -join "`r`n"
+    $ans = [Windows.Forms.MessageBox]::Show(
+      "Apply these $($items.Count) change(s)?`r`n`r`n$names`r`n`r`nThe adapter resets, so the connection drops for a second or two.",
+      'TsakasOptimizer', 'YesNo', 'Question')
+    if ($ans -ne 'Yes') { return }
+    $done = 0; $errs = @()
+    foreach ($it in $items) {
+      try { Invoke-NetFix $it.Tag; $done++ }
+      catch { $errs += "{0}: {1}" -f $it.Tag.Setting, $_.Exception.Message }
+    }
+    & $loadNet
+    $ntext.Text = ("Changed {0} setting(s).{1}" -f $done, $(if ($errs) { '  Failed: ' + ($errs -join ' | ') } else { '  Undo them with the Undo button on the first tab.' })) +
+      "`r`n`r`n" + $ntext.Text
   })
 
   # bottom-right of the tab page, once the real sizes exist
@@ -1016,6 +1193,14 @@ function Invoke-SelfTest {
     @{N = 'a Windows service is never guessed';   R = ((Get-ServiceGuess ([pscustomobject]@{Name='SomeUpdateSvc';DisplayName='Some Update Service';PathName="$env:SystemRoot\system32\svchost.exe";State='Running'})).Score -eq 0)}
     @{N = 'audio/driver services are left alone'; R = ((Get-ServiceGuess ([pscustomobject]@{Name='RtkAudUService';DisplayName='Realtek Audio Universal Service';PathName='C:\Program Files\Realtek\x.exe';State='Running'})).Score -eq 0)}
     @{N = 'autostart name prefix match works';    R = (Test-AutoStarts 'Overwolf' (New-Object System.Collections.Generic.HashSet[string] ([string[]]@('OverwolfLauncher'), [StringComparer]::OrdinalIgnoreCase)))}
+    # network tab
+    @{N = 'enabled green ethernet is flagged';    R = ((Get-NetOffValue 'Green Ethernet' 'Enabled' @('Disabled','Enabled')) -eq 'Disabled')}
+    @{N = 'already-off setting is not flagged';   R = ($null -eq (Get-NetOffValue 'Green Ethernet' 'Disabled' @('Disabled','Enabled')))}
+    @{N = 'EEE speed list is not a toggle';       R = ($null -eq (Get-NetOffValue 'EEE Max Support Speed' '2.5 Gbps Full Duplex' @('1.0 Gbps Full Duplex','2.5 Gbps Full Duplex')))}
+    @{N = 'unrelated settings are left alone';    R = ($null -eq (Get-NetOffValue 'Jumbo Frame' 'Enabled' @('Disabled','Enabled')))}
+    @{N = 'wake-on-lan is left alone';            R = ($null -eq (Get-NetOffValue 'Wake on Magic Packet' 'Enabled' @('Disabled','Enabled')))}
+    @{N = 'Off counts as off';                    R = ($null -eq (Get-NetOffValue 'Power Saving Mode' 'Off' @('Off','On')))}
+    @{N = 'network scan runs without error';      R = ((@(Get-NetFindings)).Count -ge 0)}
     # motherboard tab
     @{N = 'a 2 year old BIOS is flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-24);AgeMonths=24;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'over 18 months old'}
     @{N = 'a recent BIOS is not flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'BIOS is recent'}
