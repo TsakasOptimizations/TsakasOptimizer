@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.4.0'
+$Version = '1.4.1'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -1101,7 +1101,7 @@ function Show-Gui {
     $head.Font = New-Object Drawing.Font($display, 18)
     $head.ForeColor = $ink
     $head.AutoSize = $true
-    $head.Location = New-Object Drawing.Point(12, 20)
+    $head.Location = New-Object Drawing.Point(12, 12)
     $pane.Controls.Add($head)
 
     $sub = New-Object Windows.Forms.Label
@@ -1109,12 +1109,13 @@ function Show-Gui {
     $sub.Font = New-Object Drawing.Font($family, 10)
     $sub.ForeColor = $muted
     $sub.AutoSize = $true
-    $sub.Location = New-Object Drawing.Point(14, 50)
+    $sub.Location = New-Object Drawing.Point(14, ($head.Bottom + 2))
     $pane.Controls.Add($sub)
 
+    $bodyTop = $sub.Bottom + 8
     $body = New-Object Windows.Forms.Panel
-    $body.Location = New-Object Drawing.Point(0, 76)
-    $body.Size = New-Object Drawing.Size(832, 504)
+    $body.Location = New-Object Drawing.Point(0, $bodyTop)
+    $body.Size = New-Object Drawing.Size(832, (592 - $bodyTop - 6))
     $body.Anchor = 'Top,Left,Right,Bottom'
     $body.BackColor = $panel
     $pane.Controls.Add($body)
