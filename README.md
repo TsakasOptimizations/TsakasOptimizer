@@ -1,3 +1,5 @@
+<img src="logo.png" alt="TsakasOptimizer" width="420">
+
 # TsakasOptimizer
 
 A single PowerShell script that looks at what is running on a Windows PC, points

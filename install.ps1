@@ -9,8 +9,10 @@ $ErrorActionPreference = 'Stop'
 
 $Repo   = 'TsakasOptimizations/TsakasOptimizer'
 $RawUrl = "https://raw.githubusercontent.com/$Repo/main/TsakasOptimizer.ps1"
+$IconUrl = "https://raw.githubusercontent.com/$Repo/main/icon.ico"
 $Dir    = Join-Path $env:LOCALAPPDATA 'TsakasOptimizer'
 $Script = Join-Path $Dir 'TsakasOptimizer.ps1'
+$Icon   = Join-Path $Dir 'icon.ico'
 
 Write-Host ''
 Write-Host '  Installing TsakasOptimizer...' -ForegroundColor Cyan
@@ -23,6 +25,11 @@ if ($text.Length -lt 5000 -or $text -notmatch 'function Show-Gui') {
 
 if (-not (Test-Path $Dir)) { [void](New-Item -ItemType Directory -Path $Dir -Force) }
 Set-Content -Path $Script -Value $text -Encoding UTF8
+
+# the shortcut icon; not fatal if it cannot be fetched
+try {
+  Invoke-WebRequest -Uri $IconUrl -UseBasicParsing -TimeoutSec 20 -OutFile $Icon
+} catch { $Icon = $null }
 
 $version = if ($text -match "(?m)^\s*\`$Version\s*=\s*'([\d.]+)'") { $Matches[1] } else { '?' }
 
@@ -38,6 +45,7 @@ foreach ($lnk in $links) {
   $s.Arguments        = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Script`""
   $s.WorkingDirectory = $Dir
   $s.Description      = 'Find background apps and services worth closing'
+  if ($Icon -and (Test-Path $Icon)) { $s.IconLocation = $Icon }
   $s.Save()
 }
 

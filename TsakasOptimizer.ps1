@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.3.2'
+$Version = '1.4.0'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -32,6 +32,99 @@ function Install-Update([string]$Text) {
   if ($Text.Length -lt 5000 -or $Text -notmatch 'function Show-Gui') { throw 'the download looks incomplete' }
   Copy-Item $PSCommandPath "$PSCommandPath.bak" -Force
   Set-Content -Path $PSCommandPath -Value $Text -Encoding UTF8
+}
+
+# --- app icon ----------------------------------------------------------------
+# Carried in the script so the window is branded even when run straight from the
+# web, where there is no icon file on disk. 16/32/48 only; the full icon.ico in
+# the repo is what the installer puts on the shortcut.
+$IconB64 = @(
+  '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'
+) -join ''
+
+function Get-AppIcon {
+  try {
+    $bytes = [Convert]::FromBase64String($IconB64)
+    $stream = New-Object IO.MemoryStream(,$bytes)
+    return New-Object Drawing.Icon($stream)
+  } catch { return $null }
 }
 
 # --- never touch -------------------------------------------------------------
@@ -904,6 +997,8 @@ function Show-Gui {
 
   $form = New-Object Windows.Forms.Form
   $form.Text = "TsakasOptimizer $Version"
+  $icon = Get-AppIcon
+  if ($icon) { $form.Icon = $icon }
   $form.ClientSize = New-Object Drawing.Size(1040, 640)
   $form.MinimumSize = New-Object Drawing.Size(960, 620)
   $form.StartPosition = 'CenterScreen'
