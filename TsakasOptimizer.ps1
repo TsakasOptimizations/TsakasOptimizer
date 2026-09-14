@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.3.0'
+$Version = '1.3.1'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -712,6 +712,76 @@ function Set-Rounded($Ctrl, [int]$Radius) {
   $Ctrl.Add_Resize($apply)
 }
 
+function Shift-Color($C, [int]$Amount) {
+  [Drawing.Color]::FromArgb($C.A,
+    [Math]::Max(0, [Math]::Min(255, [int]$C.R + $Amount)),
+    [Math]::Max(0, [Math]::Min(255, [int]$C.G + $Amount)),
+    [Math]::Max(0, [Math]::Min(255, [int]$C.B + $Amount)))
+}
+
+# Painted by hand: vertical gradient, a sheen over the top half, a defined edge.
+# $Bg is whatever sits behind the button, so the rounded corners can be
+# antialiased against it instead of clipped square by a region.
+function Set-Glossy($Btn, $Top, $Bottom, $Border, $Fore, $Bg, [int]$Radius) {
+  $Btn.FlatStyle = 'Flat'
+  $Btn.FlatAppearance.BorderSize = 0
+  $Btn.FlatAppearance.MouseOverBackColor = $Bg
+  $Btn.FlatAppearance.MouseDownBackColor = $Bg
+  $Btn.BackColor = $Bg
+  $Btn.ForeColor = $Fore
+  $Btn.UseVisualStyleBackColor = $false
+  $Btn.Region = $null
+  $state = New-Object psobject -Property @{ Hot = $false; Down = $false }
+
+  $Btn.Add_MouseEnter({ $state.Hot = $true;  $Btn.Invalidate() }.GetNewClosure())
+  $Btn.Add_MouseLeave({ $state.Hot = $false; $state.Down = $false; $Btn.Invalidate() }.GetNewClosure())
+  $Btn.Add_MouseDown({ $state.Down = $true;  $Btn.Invalidate() }.GetNewClosure())
+  $Btn.Add_MouseUp({   $state.Down = $false; $Btn.Invalidate() }.GetNewClosure())
+
+  $Btn.Add_Paint({
+    param($s, $e)
+    $g = $e.Graphics
+    $g.Clear($Bg)
+    if (-not $s.Enabled) { return }
+    $g.SmoothingMode = 'AntiAlias'
+    $rect = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+    $path = New-RoundPath $rect $Radius
+
+    $t = $Top; $b = $Bottom
+    if ($state.Down)     { $t = Shift-Color $Top -18; $b = Shift-Color $Bottom -18 }
+    elseif ($state.Hot)  { $t = Shift-Color $Top 10;  $b = Shift-Color $Bottom 10 }
+
+    $fill = New-Object Drawing.Drawing2D.LinearGradientBrush($rect, $t, $b, 90)
+    $g.FillPath($fill, $path)
+
+    $saved = $g.Clip
+    $g.SetClip($path)
+    $half = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), [int](($s.Height - 1) / 2))
+    if ($half.Height -gt 0) {
+      $sheen = New-Object Drawing.Drawing2D.LinearGradientBrush($half,
+        [Drawing.Color]::FromArgb(120, 255, 255, 255), [Drawing.Color]::FromArgb(18, 255, 255, 255), 90)
+      $g.FillRectangle($sheen, $half)
+      $sheen.Dispose()
+    }
+    $g.Clip = $saved
+
+    $pen = New-Object Drawing.Pen($Border, 1)
+    $g.DrawPath($pen, $path)
+
+    $fmt = New-Object Drawing.StringFormat
+    $fmt.LineAlignment = 'Center'
+    $fmt.Alignment = $(if ($s.TextAlign -eq 'MiddleLeft') { 'Near' } else { 'Center' })
+    $fmt.FormatFlags = 'NoWrap'
+    $fmt.Trimming = 'EllipsisCharacter'
+    $pad = $(if ($s.TextAlign -eq 'MiddleLeft') { 12 } else { 0 })
+    $textRect = New-Object Drawing.RectangleF($pad, 0, ($s.Width - $pad), $s.Height)
+    $brush = New-Object Drawing.SolidBrush($s.ForeColor)
+    $g.DrawString($s.Text, $s.Font, $brush, $textRect, $fmt)
+
+    $fill.Dispose(); $pen.Dispose(); $brush.Dispose(); $path.Dispose(); $fmt.Dispose(); $brush.Dispose()
+  }.GetNewClosure())
+}
+
 # wraps a control in a padded white card and returns the card
 function Add-PaddedCard($Ctrl, [int]$Radius, $LineColor, [int]$Pad) {
   $card = New-Object Windows.Forms.Panel
@@ -785,21 +855,19 @@ function Show-Gui {
   $display = & $pickFamily 'Segoe UI Variable Display Semib' (& $pickFamily 'Segoe UI Semibold' 'Segoe UI')
   $form.Font = New-Object Drawing.Font($family, 10)
 
+  # the ground everything sits on, so glossy corners can blend into it
+  $btnEdge = [Drawing.Color]::FromArgb(188, 189, 196)
   $flat = {
     param($b, $primary)
-    $b.FlatStyle = 'Flat'
     $b.Cursor = 'Hand'
-    $b.FlatAppearance.BorderSize = 0
-    $b.Height = 32
+    $b.Height = 34
     if ($primary) {
-      $b.BackColor = $accent; $b.ForeColor = $white
-      $b.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(0, 102, 214)
       $b.Font = New-Object Drawing.Font($semi, 10)
+      Set-Glossy $b ([Drawing.Color]::FromArgb(64, 150, 240)) ([Drawing.Color]::FromArgb(0, 105, 214)) `
+                 ([Drawing.Color]::FromArgb(0, 84, 173)) $white $panel 8
     } else {
-      $b.BackColor = $white; $b.ForeColor = $ink
-      $b.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(236, 236, 239)
+      Set-Glossy $b $white ([Drawing.Color]::FromArgb(226, 227, 233)) $btnEdge $ink $panel 8
     }
-    Set-Rounded $b 8
   }
 
   # ---- sidebar ----
@@ -962,8 +1030,8 @@ function Show-Gui {
   }
   $btnApply   = & $mkButton 'Apply selected' 12  130
   $btnRefresh = & $mkButton 'Rescan'         150 90
-  $btnUndo    = & $mkButton 'Undo changes'   248 110
-  $btnElev    = & $mkButton 'Restart app as admin' 366 160
+  $btnUndo    = & $mkButton 'Undo changes'   248 124
+  $btnElev    = & $mkButton 'Restart app as admin' 380 160
   & $flat $btnApply $true
   $btnElev.Visible = -not (Test-Admin)
   $btnElev.Anchor = 'Bottom,Right'
@@ -1336,7 +1404,7 @@ function Show-Gui {
     $t.Font = New-Object Drawing.Font($family, 10)
   }
   $details.ForeColor = $muted
-  $detailsCard = Add-PaddedCard $details 10 $line 12
+  $detailsCard = Add-PaddedCard $details 10 $line 8
   $mtextCard   = Add-PaddedCard $mtext   10 $line 14
   $btextCard   = Add-PaddedCard $btext   10 $line 14
   $ntextCard   = Add-PaddedCard $ntext   10 $line 14
