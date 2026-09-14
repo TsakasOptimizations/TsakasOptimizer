@@ -712,6 +712,24 @@ function Set-Rounded($Ctrl, [int]$Radius) {
   $Ctrl.Add_Resize($apply)
 }
 
+# wraps a control in a padded white card and returns the card
+function Add-PaddedCard($Ctrl, [int]$Radius, $LineColor, [int]$Pad) {
+  $card = New-Object Windows.Forms.Panel
+  $card.Location = $Ctrl.Location
+  $card.Size = $Ctrl.Size
+  $card.Anchor = $Ctrl.Anchor
+  $card.BackColor = [Drawing.Color]::White
+  $Ctrl.Parent.Controls.Add($card)
+  $card.Controls.Add($Ctrl)
+  $Ctrl.Location = New-Object Drawing.Point($Pad, $Pad)
+  $Ctrl.Size = New-Object Drawing.Size(($card.Width - 2 * $Pad), ($card.Height - 2 * $Pad))
+  $Ctrl.Anchor = 'Top,Left,Right,Bottom'
+  $Ctrl.BorderStyle = 'None'
+  Set-Rounded $card $Radius
+  Add-Hairline $card $LineColor $Radius
+  $card
+}
+
 # a 1px rounded outline drawn by the parent, just outside the control
 function Add-Hairline($Ctrl, $Color, [int]$Radius) {
   if (-not $Ctrl.Parent) { return }
@@ -749,15 +767,23 @@ function Show-Gui {
   $form.BackColor = $panel
   $form.ForeColor = $ink
 
-  # Segoe UI Variable is the Windows 11 family with optical sizes; older builds fall back
-  $family = 'Segoe UI'
-  try {
-    $probe = New-Object Drawing.Font('Segoe UI Variable Text', 9)
-    if ($probe.Name -eq 'Segoe UI Variable Text') { $family = 'Segoe UI Variable Text' }
-    $probe.Dispose()
-  } catch { }
-  $display = if ($family -like '*Variable*') { 'Segoe UI Variable Display' } else { 'Segoe UI' }
-  $form.Font = New-Object Drawing.Font($family, 9.5)
+  # Segoe UI Variable ships one face per optical size on Windows 11. Use the face
+  # meant for each size rather than scaling one family, and fall back on older builds.
+  $pickFamily = {
+    param($name, $fallback)
+    try {
+      $probe = New-Object Drawing.Font($name, 9)
+      $ok = ($probe.Name -eq $name)
+      $probe.Dispose()
+      if ($ok) { return $name }
+    } catch { }
+    return $fallback
+  }
+  $family  = & $pickFamily 'Segoe UI Variable Text' 'Segoe UI'
+  $small   = & $pickFamily 'Segoe UI Variable Small' $family
+  $semi    = & $pickFamily 'Segoe UI Variable Text Semibold' (& $pickFamily 'Segoe UI Semibold' 'Segoe UI')
+  $display = & $pickFamily 'Segoe UI Variable Display Semib' (& $pickFamily 'Segoe UI Semibold' 'Segoe UI')
+  $form.Font = New-Object Drawing.Font($family, 10)
 
   $flat = {
     param($b, $primary)
@@ -768,7 +794,7 @@ function Show-Gui {
     if ($primary) {
       $b.BackColor = $accent; $b.ForeColor = $white
       $b.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(0, 102, 214)
-      $b.Font = New-Object Drawing.Font($family, 9.5, [Drawing.FontStyle]::Bold)
+      $b.Font = New-Object Drawing.Font($semi, 10)
     } else {
       $b.BackColor = $white; $b.ForeColor = $ink
       $b.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(236, 236, 239)
@@ -793,7 +819,7 @@ function Show-Gui {
 
   $brand = New-Object Windows.Forms.Label
   $brand.Text = 'TsakasOptimizer'
-  $brand.Font = New-Object Drawing.Font($display, 13.5, [Drawing.FontStyle]::Bold)
+  $brand.Font = New-Object Drawing.Font($display, 14)
   $brand.ForeColor = $ink
   $brand.AutoSize = $true
   $brand.Location = New-Object Drawing.Point(20, 26)
@@ -801,7 +827,7 @@ function Show-Gui {
 
   $verLabel = New-Object Windows.Forms.Label
   $verLabel.Text = "Version $Version"
-  $verLabel.Font = New-Object Drawing.Font($family, 8.5)
+  $verLabel.Font = New-Object Drawing.Font($small, 9)
   $verLabel.ForeColor = $muted
   $verLabel.AutoSize = $true
   $verLabel.Location = New-Object Drawing.Point(21, 52)
@@ -828,7 +854,7 @@ function Show-Gui {
 
     $head = New-Object Windows.Forms.Label
     $head.Text = $sections[$i].Title
-    $head.Font = New-Object Drawing.Font($display, 17, [Drawing.FontStyle]::Bold)
+    $head.Font = New-Object Drawing.Font($display, 18)
     $head.ForeColor = $ink
     $head.AutoSize = $true
     $head.Location = New-Object Drawing.Point(12, 20)
@@ -836,7 +862,7 @@ function Show-Gui {
 
     $sub = New-Object Windows.Forms.Label
     $sub.Text = $sections[$i].Sub
-    $sub.Font = New-Object Drawing.Font($family, 9.5)
+    $sub.Font = New-Object Drawing.Font($family, 10)
     $sub.ForeColor = $muted
     $sub.AutoSize = $true
     $sub.Location = New-Object Drawing.Point(14, 50)
@@ -878,11 +904,11 @@ function Show-Gui {
       if ($k -eq $index) {
         $navs[$k].BackColor = $accent
         $navs[$k].ForeColor = $white
-        $navs[$k].Font = New-Object Drawing.Font($family, 9.5, [Drawing.FontStyle]::Bold)
+        $navs[$k].Font = New-Object Drawing.Font($semi, 10)
       } else {
         $navs[$k].BackColor = $white
         $navs[$k].ForeColor = $ink
-        $navs[$k].Font = New-Object Drawing.Font($family, 9.5)
+        $navs[$k].Font = New-Object Drawing.Font($family, 10)
       }
     }
     $form.Cursor = 'WaitCursor'
@@ -985,6 +1011,7 @@ function Show-Gui {
   $contact = New-Object Windows.Forms.LinkLabel
   $contact.AutoSize = $true
   $contact.Location = New-Object Drawing.Point(14, 16)
+  $contact.Font = New-Object Drawing.Font($small, 9.5)
   $contact.Text = 'Need advice for your rig?  Discord: _tsakas_    X: @TsakasIoannis'
   $contact.ForeColor = $muted
   $contact.LinkColor = $accent
@@ -1256,8 +1283,8 @@ function Show-Gui {
     # an empty grid is just dead space - drop it and let the report fill the pane
     $nlv.Visible = ($nlv.Items.Count -gt 0)
     $btnNet.Visible = ($nlv.Items.Count -gt 0)
-    $ntext.Top = $(if ($nlv.Visible) { 212 } else { 12 })
-    $ntext.Height = $(if ($nlv.Visible) { 240 } else { 440 })
+    $ntextCard.Top = $(if ($nlv.Visible) { 212 } else { 12 })
+    $ntextCard.Height = $(if ($nlv.Visible) { 240 } else { 440 })
 
     $head = if ($nlv.Items.Count -eq 0) {
       'Nothing to change - every power saving setting this tool checks is already off.'
@@ -1295,19 +1322,25 @@ function Show-Gui {
 
   # ---- every list and text pane becomes a rounded white card ----
   $rowHeight = New-Object Windows.Forms.ImageList
-  $rowHeight.ImageSize = New-Object Drawing.Size(1, 26)
+  $rowHeight.ImageSize = New-Object Drawing.Size(1, 28)
   foreach ($l in @($lv, $mlv, $blv, $nlv)) {
     $l.SmallImageList = $rowHeight
     $l.BorderStyle = 'None'
     $l.HeaderStyle = 'Nonclickable'
-    $l.Font = New-Object Drawing.Font($family, 9.5)
+    $l.Font = New-Object Drawing.Font($family, 10)
   }
+  # the reports are prose, so a proportional face reads far better than Consolas
   foreach ($t in @($details, $mtext, $btext, $ntext)) {
-    $t.BorderStyle = 'None'
     $t.BackColor = $white
+    $t.ForeColor = $ink
+    $t.Font = New-Object Drawing.Font($family, 10)
   }
-  $details.Font = New-Object Drawing.Font($family, 9.5)
-  foreach ($c in @($lv, $details, $mlv, $mtext, $blv, $btext, $nlv, $ntext)) {
+  $details.ForeColor = $muted
+  $detailsCard = Add-PaddedCard $details 10 $line 12
+  $mtextCard   = Add-PaddedCard $mtext   10 $line 14
+  $btextCard   = Add-PaddedCard $btext   10 $line 14
+  $ntextCard   = Add-PaddedCard $ntext   10 $line 14
+  foreach ($c in @($lv, $mlv, $blv, $nlv)) {
     Set-Rounded $c 10
     Add-Hairline $c $line 10
   }
