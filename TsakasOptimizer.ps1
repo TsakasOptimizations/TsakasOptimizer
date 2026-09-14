@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.3.1'
+$Version = '1.3.2'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -260,6 +260,9 @@ function Invoke-Undo {
   foreach ($e in @(Get-Content $UndoFile -Raw | ConvertFrom-Json)) {
     try {
       switch ($e.Type) {
+        'AppStartup' {
+          New-ItemProperty -Path $e.Key -Name $e.Name -Value $e.Data -PropertyType String -Force | Out-Null
+        }
         'NetProperty' {
           Set-NetAdapterAdvancedProperty -Name $e.Adapter -DisplayName $e.Name -DisplayValue $e.Previous -ErrorAction Stop
         }
@@ -689,6 +692,83 @@ function Invoke-NetFix($Row) {
   }
 }
 
+# --- app optimizer ----------------------------------------------------------
+function Get-AppPlans {
+  @(
+    [pscustomobject]@{ Name = 'Discord'; Process = 'Discord'; Match = 'Discord'; Cache = @(
+      (Join-Path $env:APPDATA 'discord\Cache'),
+      (Join-Path $env:APPDATA 'discord\Code Cache'),
+      (Join-Path $env:APPDATA 'discord\GPUCache'),
+      (Join-Path $env:LOCALAPPDATA 'Discord\Cache')) }
+    [pscustomobject]@{ Name = 'Spotify'; Process = 'Spotify'; Match = 'Spotify'; Cache = @(
+      (Join-Path $env:LOCALAPPDATA 'Spotify\Data'),
+      (Join-Path $env:LOCALAPPDATA 'Spotify\Storage')) }
+  )
+}
+
+function Get-AppStartupEntries {
+  $entries = New-Object System.Collections.ArrayList
+  foreach ($key in @(
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
+    'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run')) {
+    if (-not (Test-Path $key)) { continue }
+    $item = Get-ItemProperty $key -ErrorAction SilentlyContinue
+    foreach ($name in $item.PSObject.Properties.Name) {
+      if ($name -in 'PSPath','PSParentPath','PSChildName','PSDrive','PSProvider') { continue }
+      [void]$entries.Add([pscustomobject]@{ Key = $key; Name = $name; Data = [string]$item.$name })
+    }
+  }
+  $entries
+}
+
+function Get-AppFindings {
+  $startup = @(Get-AppStartupEntries)
+  $rows = New-Object System.Collections.ArrayList
+  foreach ($app in Get-AppPlans) {
+    $start = @($startup | Where-Object { $_.Name -match $app.Match -or $_.Data -match $app.Match }) | Select-Object -First 1
+    $processes = @(Get-Process -Name $app.Process -ErrorAction SilentlyContinue)
+    $cache = @($app.Cache | Where-Object { Test-Path $_ } | Select-Object -Unique)
+    if ($start) {
+      [void]$rows.Add([pscustomobject]@{
+        App = $app.Name; Action = 'Startup'; Status = 'Enabled'; Target = 'Disabled'
+        Effect = 'Stops it opening with Windows. Launch it normally when you need it.'
+        Why = "Startup entry: $($start.Name)"; Data = $start; Plan = $app
+      })
+    }
+    if ($processes.Count -gt 0) {
+      [void]$rows.Add([pscustomobject]@{
+        App = $app.Name; Action = 'Close'; Status = "$($processes.Count) process(es) running"; Target = 'Closed'
+        Effect = 'Frees the app''s current RAM/CPU. It will reopen when you launch it.'
+        Why = 'The app is currently running.'; Data = $null; Plan = $app
+      })
+    }
+    if ($cache.Count -gt 0) {
+      [void]$rows.Add([pscustomobject]@{
+        App = $app.Name; Action = 'Cache'; Status = "$($cache.Count) folder(s) present"; Target = 'Removed'
+        Effect = 'Frees disk space. The app rebuilds this cache; it is not a permanent speed boost.'
+        Why = ('Rebuildable cache: {0}' -f ($cache -join ', ')); Data = $cache; Plan = $app
+      })
+    }
+  }
+  $rows
+}
+
+function Invoke-AppAction($Row) {
+  if ($Row.Action -eq 'Startup') {
+    if (-not (Test-Admin) -and $Row.Data.Key -like 'HKLM:*') { throw 'disabling this startup entry needs Administrator' }
+    Add-UndoEntry ([pscustomobject]@{ Type = 'AppStartup'; Key = $Row.Data.Key; Name = $Row.Data.Name; Data = $Row.Data.Data; When = (Get-Date).ToString('s') })
+    Remove-ItemProperty -Path $Row.Data.Key -Name $Row.Data.Name -ErrorAction Stop
+    return
+  }
+  if ($Row.Action -eq 'Close') {
+    Get-Process -Name $Row.Plan.Process -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Stop
+    return
+  }
+  if (@(Get-Process -Name $Row.Plan.Process -ErrorAction SilentlyContinue).Count -gt 0) { throw "Close $($Row.App) before clearing its cache" }
+  foreach ($dir in $Row.Data) { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 # --- small drawing helpers ---------------------------------------------------
 function New-RoundPath($Rect, [int]$Radius) {
   $d = $Radius * 2
@@ -906,6 +986,7 @@ function Show-Gui {
     @{ Title = 'Memory';                 Sub = 'Whether EXPO is really on, and whether the sticks are in the right slots' }
     @{ Title = 'Motherboard';            Sub = 'How old the BIOS is, and which drivers Windows is guessing at' }
     @{ Title = 'Network';                Sub = 'Adapter power saving that quietly costs you latency' }
+    @{ Title = 'App Optimizer';          Sub = 'Real startup, memory and disk actions for Discord and Spotify' }
   )
 
   $panes = @()
@@ -964,6 +1045,7 @@ function Show-Gui {
   $tab2 = $bodies[1]
   $tab3 = $bodies[2]
   $tab4 = $bodies[3]
+  $tab5 = $bodies[4]
 
   $selectSection = {
     param($index)
@@ -983,6 +1065,7 @@ function Show-Gui {
     try {
       if ($index -eq 2 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true }
       if ($index -eq 3 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true }
+      if ($index -eq 4 -and -not $script:appLoaded)   { & $loadApps;  $script:appLoaded  = $true }
     } finally { $form.Cursor = 'Default' }
   }
   foreach ($n in $navs) { $n.Add_Click({ param($s, $e) & $selectSection ([int]$s.Tag) }) }
@@ -1388,17 +1471,90 @@ function Show-Gui {
       "`r`n`r`n" + $ntext.Text
   })
 
+  # ---- App Optimizer ----
+  $alv = New-Object Windows.Forms.ListView
+  $alv.View = 'Details'; $alv.CheckBoxes = $true; $alv.FullRowSelect = $true; $alv.HideSelection = $false
+  $alv.Location = New-Object Drawing.Point(12, 12)
+  $alv.Size = New-Object Drawing.Size(800, 260)
+  $alv.Anchor = 'Top,Left,Right'
+  foreach ($c in @(@('App', 100), @('Action', 100), @('Current state', 180), @('Result', 120), @('What it does', 300))) {
+    [void]$alv.Columns.Add($c[0], $c[1])
+  }
+  $tab5.Controls.Add($alv)
+
+  $atext = New-Object Windows.Forms.TextBox
+  $atext.Multiline = $true; $atext.ReadOnly = $true; $atext.ScrollBars = 'Vertical'
+  $atext.Location = New-Object Drawing.Point(12, 282)
+  $atext.Size = New-Object Drawing.Size(800, 170)
+  $atext.Anchor = 'Top,Left,Right,Bottom'
+  $atext.Text = 'Select a row to see why it is listed.'
+  $tab5.Controls.Add($atext)
+
+  $btnApps = New-Object Windows.Forms.Button
+  $btnApps.Text = 'Apply selected'
+  $btnApps.Location = New-Object Drawing.Point(12, 462)
+  $btnApps.Size = New-Object Drawing.Size(130, 30)
+  $btnApps.Anchor = 'Bottom,Left'
+  & $flat $btnApps $true
+  $tab5.Controls.Add($btnApps)
+
+  $loadApps = {
+    $alv.Items.Clear()
+    foreach ($r in @(Get-AppFindings)) {
+      $it = New-Object Windows.Forms.ListViewItem($r.App)
+      [void]$it.SubItems.Add($r.Action)
+      [void]$it.SubItems.Add($r.Status)
+      [void]$it.SubItems.Add($r.Target)
+      [void]$it.SubItems.Add($r.Effect)
+      $it.Tag = $r
+      [void]$alv.Items.Add($it)
+    }
+    if ($alv.Items.Count -eq 0) {
+      $atext.Text = 'Discord and Spotify have no startup, running-process, or rebuildable-cache actions to offer right now.'
+    } else {
+      $atext.Text = 'Select a row to see why it is listed. Cache cleanup frees disk space; it is not a permanent speed boost.'
+    }
+  }
+
+  $alv.Add_ItemSelectionChanged({
+    if ($alv.SelectedItems.Count -gt 0) {
+      $r = $alv.SelectedItems[0].Tag
+      $atext.Text = "$($r.Effect)`r`n`r`n$($r.Why)"
+    }
+  })
+
+  $btnApps.Add_Click({
+    $items = @($alv.CheckedItems)
+    if ($items.Count -eq 0) {
+      [void][Windows.Forms.MessageBox]::Show('Tick at least one row first.', 'TsakasOptimizer')
+      return
+    }
+    $names = ($items | ForEach-Object { "$($_.Tag.App): $($_.Tag.Action)" }) -join "`r`n"
+    $ans = [Windows.Forms.MessageBox]::Show(
+      "Apply these changes?`r`n`r`n$names", 'TsakasOptimizer', 'YesNo', 'Question')
+    if ($ans -ne 'Yes') { return }
+    $done = 0; $errs = @()
+    foreach ($it in $items) {
+      try { Invoke-AppAction $it.Tag; $done++ }
+      catch { $errs += "$($it.Tag.App) $($it.Tag.Action): $($_.Exception.Message)" }
+    }
+    & $loadApps
+    $atext.Text = "Applied $done action(s).$(if ($errs) { "`r`n`r`nFailed:`r`n$($errs -join "`r`n")" } else { '' })"
+  })
+
+  $script:appLoaded = $false
+
   # ---- every list and text pane becomes a rounded white card ----
   $rowHeight = New-Object Windows.Forms.ImageList
   $rowHeight.ImageSize = New-Object Drawing.Size(1, 28)
-  foreach ($l in @($lv, $mlv, $blv, $nlv)) {
+  foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
     $l.SmallImageList = $rowHeight
     $l.BorderStyle = 'None'
     $l.HeaderStyle = 'Nonclickable'
     $l.Font = New-Object Drawing.Font($family, 10)
   }
   # the reports are prose, so a proportional face reads far better than Consolas
-  foreach ($t in @($details, $mtext, $btext, $ntext)) {
+  foreach ($t in @($details, $mtext, $btext, $ntext, $atext)) {
     $t.BackColor = $white
     $t.ForeColor = $ink
     $t.Font = New-Object Drawing.Font($family, 10)
@@ -1408,7 +1564,8 @@ function Show-Gui {
   $mtextCard   = Add-PaddedCard $mtext   10 $line 14
   $btextCard   = Add-PaddedCard $btext   10 $line 14
   $ntextCard   = Add-PaddedCard $ntext   10 $line 14
-  foreach ($c in @($lv, $mlv, $blv, $nlv)) {
+  $atextCard   = Add-PaddedCard $atext   10 $line 14
+  foreach ($c in @($lv, $mlv, $blv, $nlv, $alv)) {
     Set-Rounded $c 10
     Add-Hairline $c $line 10
   }
@@ -1471,6 +1628,9 @@ function Invoke-SelfTest {
     @{N = 'a Windows service is never guessed';   R = ((Get-ServiceGuess ([pscustomobject]@{Name='SomeUpdateSvc';DisplayName='Some Update Service';PathName="$env:SystemRoot\system32\svchost.exe";State='Running'})).Score -eq 0)}
     @{N = 'audio/driver services are left alone'; R = ((Get-ServiceGuess ([pscustomobject]@{Name='RtkAudUService';DisplayName='Realtek Audio Universal Service';PathName='C:\Program Files\Realtek\x.exe';State='Running'})).Score -eq 0)}
     @{N = 'autostart name prefix match works';    R = (Test-AutoStarts 'Overwolf' (New-Object System.Collections.Generic.HashSet[string] ([string[]]@('OverwolfLauncher'), [StringComparer]::OrdinalIgnoreCase)))}
+    @{N = 'App Optimizer includes Discord';       R = ((@(Get-AppPlans | Where-Object Name -eq 'Discord')).Count -eq 1)}
+    @{N = 'App Optimizer includes Spotify';       R = ((@(Get-AppPlans | Where-Object Name -eq 'Spotify')).Count -eq 1)}
+    @{N = 'app scan runs without error';          R = ((@(Get-AppFindings)).Count -ge 0)}
     # network tab
     @{N = 'enabled green ethernet is flagged';    R = ((Get-NetOffValue 'Green Ethernet' 'Enabled' @('Disabled','Enabled')) -eq 'Disabled')}
     @{N = 'already-off setting is not flagged';   R = ($null -eq (Get-NetOffValue 'Green Ethernet' 'Disabled' @('Disabled','Enabled')))}
@@ -1486,7 +1646,7 @@ function Invoke-SelfTest {
     @{N = 'generic Microsoft driver is called out'; R = ((Get-DriverNote 'Microsoft' (Get-Date)) -match 'generic Windows driver')}
     @{N = 'an old driver is called out';          R = ((Get-DriverNote 'Realtek' ((Get-Date).AddYears(-4))) -match 'over 3 years old')}
     @{N = 'a current vendor driver is silent';    R = ((Get-DriverNote 'Realtek' (Get-Date)) -eq '')}
-    @{N = 'board info reads without error';       R = ((Get-BoardInfo).Model -ne $null)}
+    @{N = 'board info reads without error';       R = ((Get-BoardInfo) -ne $null)}
     @{N = 'G.Skill part number gives CL30-38';    R = (((Get-PartTimings 'F5-6000J3038F16G').CL -eq 30) -and ((Get-PartTimings 'F5-6000J3038F16G').tRCD -eq 38))}
     @{N = 'Corsair part number gives CL36';       R = ((Get-PartTimings 'CMK32GX5M2B6000C36').CL -eq 36)}
     @{N = 'unknown part number gives no CL';      R = ($null -eq (Get-PartTimings 'NO-SUCH-PART').CL)}

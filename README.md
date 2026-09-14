@@ -59,6 +59,13 @@ it if you want them back on Automatic.
 Nothing is ticked for you. Processes are closed; services are set to Manual,
 which is reversible with the Undo button.
 
+**App Optimizer tab.** Discord and Spotify only. It can disable their Windows
+startup entry, close their running processes, and remove rebuildable cache
+folders. Startup changes are reversible with Undo; closing frees current RAM
+and CPU until the app is opened again; cache cleanup frees disk space but is
+not a permanent performance boost. It does not change app settings, updates,
+audio quality, or network behaviour.
+
 Never suggested: Windows components, anything under `C:\Windows`, anything whose
 executable cannot be read, and anything that looks like antivirus, firewall,
 VPN, audio, drivers, storage or virtualisation.
