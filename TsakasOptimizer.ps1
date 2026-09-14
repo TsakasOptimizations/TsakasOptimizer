@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.2.0'
+$Version = '1.3.0'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -689,6 +689,46 @@ function Invoke-NetFix($Row) {
   }
 }
 
+# --- small drawing helpers ---------------------------------------------------
+function New-RoundPath($Rect, [int]$Radius) {
+  $d = $Radius * 2
+  $p = New-Object Drawing.Drawing2D.GraphicsPath
+  $p.AddArc($Rect.X, $Rect.Y, $d, $d, 180, 90)
+  $p.AddArc($Rect.Right - $d, $Rect.Y, $d, $d, 270, 90)
+  $p.AddArc($Rect.Right - $d, $Rect.Bottom - $d, $d, $d, 0, 90)
+  $p.AddArc($Rect.X, $Rect.Bottom - $d, $d, $d, 90, 90)
+  $p.CloseFigure()
+  $p
+}
+
+function Set-Rounded($Ctrl, [int]$Radius) {
+  $apply = {
+    $r = New-Object Drawing.Rectangle(0, 0, $Ctrl.Width, $Ctrl.Height)
+    $path = New-RoundPath $r $Radius
+    $Ctrl.Region = New-Object Drawing.Region($path)
+    $path.Dispose()
+  }.GetNewClosure()
+  & $apply
+  $Ctrl.Add_Resize($apply)
+}
+
+# a 1px rounded outline drawn by the parent, just outside the control
+function Add-Hairline($Ctrl, $Color, [int]$Radius) {
+  if (-not $Ctrl.Parent) { return }
+  $h = {
+    param($s, $e)
+    $b = $Ctrl.Bounds
+    $b.Inflate(1, 1)
+    $e.Graphics.SmoothingMode = 'AntiAlias'
+    $path = New-RoundPath $b ($Radius + 1)
+    $pen = New-Object Drawing.Pen($Color, 1)
+    $e.Graphics.DrawPath($pen, $path)
+    $pen.Dispose(); $path.Dispose()
+  }.GetNewClosure()
+  $Ctrl.Parent.Add_Paint($h)
+  $Ctrl.Parent.Invalidate()
+}
+
 # --- gui ---------------------------------------------------------------------
 function Show-Gui {
   Add-Type -AssemblyName System.Windows.Forms
@@ -696,52 +736,162 @@ function Show-Gui {
 
   $form = New-Object Windows.Forms.Form
   $form.Text = "TsakasOptimizer $Version"
-  $form.ClientSize = New-Object Drawing.Size(836, 584)
-  $form.MinimumSize = New-Object Drawing.Size(700, 520)
+  $form.ClientSize = New-Object Drawing.Size(1040, 640)
+  $form.MinimumSize = New-Object Drawing.Size(960, 620)
   $form.StartPosition = 'CenterScreen'
-  $form.Font = New-Object Drawing.Font('Segoe UI', 9)
 
-  $accent = [Drawing.Color]::FromArgb(0, 103, 192)
-  $ink    = [Drawing.Color]::FromArgb(32, 32, 32)
-  $muted  = [Drawing.Color]::FromArgb(96, 100, 108)
-  $line   = [Drawing.Color]::FromArgb(214, 217, 222)
-  $panel  = [Drawing.Color]::FromArgb(246, 247, 249)
+  $accent = [Drawing.Color]::FromArgb(0, 113, 227)
+  $ink    = [Drawing.Color]::FromArgb(29, 29, 31)
+  $muted  = [Drawing.Color]::FromArgb(110, 110, 115)
+  $line   = [Drawing.Color]::FromArgb(210, 210, 215)
+  $panel  = [Drawing.Color]::FromArgb(245, 245, 247)
+  $white  = [Drawing.Color]::White
   $form.BackColor = $panel
   $form.ForeColor = $ink
+
+  # Segoe UI Variable is the Windows 11 family with optical sizes; older builds fall back
+  $family = 'Segoe UI'
+  try {
+    $probe = New-Object Drawing.Font('Segoe UI Variable Text', 9)
+    if ($probe.Name -eq 'Segoe UI Variable Text') { $family = 'Segoe UI Variable Text' }
+    $probe.Dispose()
+  } catch { }
+  $display = if ($family -like '*Variable*') { 'Segoe UI Variable Display' } else { 'Segoe UI' }
+  $form.Font = New-Object Drawing.Font($family, 9.5)
 
   $flat = {
     param($b, $primary)
     $b.FlatStyle = 'Flat'
     $b.Cursor = 'Hand'
-    $b.FlatAppearance.BorderSize = 1
+    $b.FlatAppearance.BorderSize = 0
+    $b.Height = 32
     if ($primary) {
-      $b.BackColor = $accent; $b.ForeColor = [Drawing.Color]::White
-      $b.FlatAppearance.BorderColor = $accent
-      $b.Font = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold)
+      $b.BackColor = $accent; $b.ForeColor = $white
+      $b.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(0, 102, 214)
+      $b.Font = New-Object Drawing.Font($family, 9.5, [Drawing.FontStyle]::Bold)
     } else {
-      $b.BackColor = [Drawing.Color]::White; $b.ForeColor = $ink
-      $b.FlatAppearance.BorderColor = $line
+      $b.BackColor = $white; $b.ForeColor = $ink
+      $b.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(236, 236, 239)
     }
+    Set-Rounded $b 8
   }
 
-  $tabs = New-Object Windows.Forms.TabControl
-  $tabs.Location = New-Object Drawing.Point(0, 0)
-  $tabs.Size = New-Object Drawing.Size(836, 536)
-  $tabs.Anchor = 'Top,Left,Right,Bottom'
-  $tabs.Padding = New-Object Drawing.Point(14, 5)
-  $tab1 = New-Object Windows.Forms.TabPage; $tab1.Text = 'Processes and services'
-  $tab2 = New-Object Windows.Forms.TabPage; $tab2.Text = 'Memory'
-  $tab3 = New-Object Windows.Forms.TabPage; $tab3.Text = 'Motherboard'
-  $tab4 = New-Object Windows.Forms.TabPage; $tab4.Text = 'Network'
-  foreach ($t in @($tab1, $tab2, $tab3, $tab4)) { $t.BackColor = [Drawing.Color]::White; $t.UseVisualStyleBackColor = $false }
-  $tabs.TabPages.AddRange(@($tab1, $tab2, $tab3, $tab4))
-  $form.Controls.Add($tabs)
-  # a TabPage defaults to 200x100; set the real size before adding anchored children
-  $pageSize = New-Object Drawing.Size($tabs.DisplayRectangle.Width, $tabs.DisplayRectangle.Height)
-  $tab1.Size = $pageSize
-  $tab2.Size = $pageSize
-  $tab3.Size = $pageSize
-  $tab4.Size = $pageSize
+  # ---- sidebar ----
+  $side = New-Object Windows.Forms.Panel
+  $side.Location = New-Object Drawing.Point(0, 0)
+  $side.Size = New-Object Drawing.Size(208, 592)
+  $side.Anchor = 'Top,Left,Bottom'
+  $side.BackColor = $white
+  $sideLine = $line
+  $side.Add_Paint({
+    param($s, $e)
+    $pen = New-Object Drawing.Pen($sideLine, 1)
+    $e.Graphics.DrawLine($pen, $s.Width - 1, 0, $s.Width - 1, $s.Height)
+    $pen.Dispose()
+  }.GetNewClosure())
+  $form.Controls.Add($side)
+
+  $brand = New-Object Windows.Forms.Label
+  $brand.Text = 'TsakasOptimizer'
+  $brand.Font = New-Object Drawing.Font($display, 13.5, [Drawing.FontStyle]::Bold)
+  $brand.ForeColor = $ink
+  $brand.AutoSize = $true
+  $brand.Location = New-Object Drawing.Point(20, 26)
+  $side.Controls.Add($brand)
+
+  $verLabel = New-Object Windows.Forms.Label
+  $verLabel.Text = "Version $Version"
+  $verLabel.Font = New-Object Drawing.Font($family, 8.5)
+  $verLabel.ForeColor = $muted
+  $verLabel.AutoSize = $true
+  $verLabel.Location = New-Object Drawing.Point(21, 52)
+  $side.Controls.Add($verLabel)
+
+  $sections = @(
+    @{ Title = 'Processes and services'; Sub = 'Background apps and services worth closing, and the ones worth leaving alone' }
+    @{ Title = 'Memory';                 Sub = 'Whether EXPO is really on, and whether the sticks are in the right slots' }
+    @{ Title = 'Motherboard';            Sub = 'How old the BIOS is, and which drivers Windows is guessing at' }
+    @{ Title = 'Network';                Sub = 'Adapter power saving that quietly costs you latency' }
+  )
+
+  $panes = @()
+  $navs  = @()
+  $bodies = @()
+  for ($i = 0; $i -lt $sections.Count; $i++) {
+    $pane = New-Object Windows.Forms.Panel
+    $pane.Location = New-Object Drawing.Point(208, 0)
+    $pane.Size = New-Object Drawing.Size(832, 592)
+    $pane.Anchor = 'Top,Left,Right,Bottom'
+    $pane.BackColor = $panel
+    $pane.Visible = ($i -eq 0)
+    $form.Controls.Add($pane)
+
+    $head = New-Object Windows.Forms.Label
+    $head.Text = $sections[$i].Title
+    $head.Font = New-Object Drawing.Font($display, 17, [Drawing.FontStyle]::Bold)
+    $head.ForeColor = $ink
+    $head.AutoSize = $true
+    $head.Location = New-Object Drawing.Point(12, 20)
+    $pane.Controls.Add($head)
+
+    $sub = New-Object Windows.Forms.Label
+    $sub.Text = $sections[$i].Sub
+    $sub.Font = New-Object Drawing.Font($family, 9.5)
+    $sub.ForeColor = $muted
+    $sub.AutoSize = $true
+    $sub.Location = New-Object Drawing.Point(14, 50)
+    $pane.Controls.Add($sub)
+
+    $body = New-Object Windows.Forms.Panel
+    $body.Location = New-Object Drawing.Point(0, 76)
+    $body.Size = New-Object Drawing.Size(832, 504)
+    $body.Anchor = 'Top,Left,Right,Bottom'
+    $body.BackColor = $panel
+    $pane.Controls.Add($body)
+
+    $nav = New-Object Windows.Forms.Button
+    $nav.Text = $sections[$i].Title
+    $nav.TextAlign = 'MiddleLeft'
+    $nav.Padding = New-Object Windows.Forms.Padding(10, 0, 0, 0)
+    $nav.Size = New-Object Drawing.Size(176, 34)
+    $nav.Location = New-Object Drawing.Point(16, (96 + $i * 40))
+    $nav.FlatStyle = 'Flat'
+    $nav.FlatAppearance.BorderSize = 0
+    $nav.Cursor = 'Hand'
+    $nav.Tag = $i
+    Set-Rounded $nav 8
+    $side.Controls.Add($nav)
+
+    $panes  += $pane
+    $navs   += $nav
+    $bodies += $body
+  }
+  $tab1 = $bodies[0]
+  $tab2 = $bodies[1]
+  $tab3 = $bodies[2]
+  $tab4 = $bodies[3]
+
+  $selectSection = {
+    param($index)
+    for ($k = 0; $k -lt $panes.Count; $k++) {
+      $panes[$k].Visible = ($k -eq $index)
+      if ($k -eq $index) {
+        $navs[$k].BackColor = $accent
+        $navs[$k].ForeColor = $white
+        $navs[$k].Font = New-Object Drawing.Font($family, 9.5, [Drawing.FontStyle]::Bold)
+      } else {
+        $navs[$k].BackColor = $white
+        $navs[$k].ForeColor = $ink
+        $navs[$k].Font = New-Object Drawing.Font($family, 9.5)
+      }
+    }
+    $form.Cursor = 'WaitCursor'
+    try {
+      if ($index -eq 2 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true }
+      if ($index -eq 3 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true }
+    } finally { $form.Cursor = 'Default' }
+  }
+  foreach ($n in $navs) { $n.Add_Click({ param($s, $e) & $selectSection ([int]$s.Tag) }) }
 
   $lv = New-Object Windows.Forms.ListView
   $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false
@@ -819,10 +969,17 @@ function Show-Gui {
 
   # ---- footer: contact on the left, update check on the right ----
   $footer = New-Object Windows.Forms.Panel
-  $footer.Location = New-Object Drawing.Point(0, 536)
-  $footer.Size = New-Object Drawing.Size(836, 48)
+  $footer.Location = New-Object Drawing.Point(0, 592)
+  $footer.Size = New-Object Drawing.Size(1040, 48)
   $footer.Anchor = 'Left,Right,Bottom'
   $footer.BackColor = $panel
+  $footerLine = $line
+  $footer.Add_Paint({
+    param($s, $e)
+    $pen = New-Object Drawing.Pen($footerLine, 1)
+    $e.Graphics.DrawLine($pen, 0, 0, $s.Width, 0)
+    $pen.Dispose()
+  }.GetNewClosure())
   $form.Controls.Add($footer)
 
   $contact = New-Object Windows.Forms.LinkLabel
@@ -1053,13 +1210,6 @@ function Show-Gui {
   # this tab costs about a second to build, so only do it when it is opened
   $script:boardLoaded = $false
   $script:netLoaded = $false
-  $tabs.Add_SelectedIndexChanged({
-    $form.Cursor = 'WaitCursor'
-    try {
-      if ($tabs.SelectedTab -eq $tab3 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true }
-      if ($tabs.SelectedTab -eq $tab4 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true }
-    } finally { $form.Cursor = 'Default' }
-  })
 
   # ---- Network tab ----
   $nlv = New-Object Windows.Forms.ListView
@@ -1103,6 +1253,12 @@ function Show-Gui {
       $it.Tag = $r
       [void]$nlv.Items.Add($it)
     }
+    # an empty grid is just dead space - drop it and let the report fill the pane
+    $nlv.Visible = ($nlv.Items.Count -gt 0)
+    $btnNet.Visible = ($nlv.Items.Count -gt 0)
+    $ntext.Top = $(if ($nlv.Visible) { 212 } else { 12 })
+    $ntext.Height = $(if ($nlv.Visible) { 240 } else { 440 })
+
     $head = if ($nlv.Items.Count -eq 0) {
       'Nothing to change - every power saving setting this tool checks is already off.'
     } else {
@@ -1137,10 +1293,31 @@ function Show-Gui {
       "`r`n`r`n" + $ntext.Text
   })
 
+  # ---- every list and text pane becomes a rounded white card ----
+  $rowHeight = New-Object Windows.Forms.ImageList
+  $rowHeight.ImageSize = New-Object Drawing.Size(1, 26)
+  foreach ($l in @($lv, $mlv, $blv, $nlv)) {
+    $l.SmallImageList = $rowHeight
+    $l.BorderStyle = 'None'
+    $l.HeaderStyle = 'Nonclickable'
+    $l.Font = New-Object Drawing.Font($family, 9.5)
+  }
+  foreach ($t in @($details, $mtext, $btext, $ntext)) {
+    $t.BorderStyle = 'None'
+    $t.BackColor = $white
+  }
+  $details.Font = New-Object Drawing.Font($family, 9.5)
+  foreach ($c in @($lv, $details, $mlv, $mtext, $blv, $btext, $nlv, $ntext)) {
+    Set-Rounded $c 10
+    Add-Hairline $c $line 10
+  }
+
+  & $selectSection 0
+
   # bottom-right of the tab page, once the real sizes exist
   $form.Add_Shown({
     $btnElev.Left = $tab1.ClientSize.Width - $btnElev.Width - 12
-    $btnElev.Top  = $tab1.ClientSize.Height - $btnElev.Height - 12
+    $btnElev.Top  = $btnApply.Top
   })
 
   [void]$form.ShowDialog()
