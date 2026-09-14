@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.4.1'
+$Version = '1.4.2'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -32,6 +32,36 @@ function Install-Update([string]$Text) {
   if ($Text.Length -lt 5000 -or $Text -notmatch 'function Show-Gui') { throw 'the download looks incomplete' }
   Copy-Item $PSCommandPath "$PSCommandPath.bak" -Force
   Set-Content -Path $PSCommandPath -Value $Text -Encoding UTF8
+  Update-SideFiles
+}
+
+# Everything that ships beside the script - so an in-app update is as complete
+# as a fresh install. Failures here never fail the update itself.
+function Update-SideFiles {
+  if (-not $PSCommandPath) { return }
+  $dir  = Split-Path $PSCommandPath
+  $icon = Join-Path $dir 'icon.ico'
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/$Branch/icon.ico" `
+      -UseBasicParsing -TimeoutSec 20 -OutFile $icon
+  } catch { }
+
+  $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  foreach ($lnk in @((Join-Path ([Environment]::GetFolderPath('Programs')) 'TsakasOptimizer.lnk'),
+                     (Join-Path ([Environment]::GetFolderPath('Desktop'))  'TsakasOptimizer.lnk'))) {
+    if (-not (Test-Path $lnk)) { continue }
+    try {
+      $shell = New-Object -ComObject WScript.Shell
+      $s = $shell.CreateShortcut($lnk)
+      # only touch shortcuts that already point at this copy
+      if ($s.Arguments -notlike "*$PSCommandPath*") { continue }
+      $s.TargetPath       = $ps
+      $s.WorkingDirectory = $dir
+      if (Test-Path $icon) { $s.IconLocation = $icon }
+      $s.Save()
+    } catch { }
+  }
 }
 
 # --- app icon ----------------------------------------------------------------

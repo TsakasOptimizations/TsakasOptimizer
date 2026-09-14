@@ -94,7 +94,9 @@ SPD/rated profile. Verify the loaded values in BIOS, ZenTimings or CPU-Z.
 `Check for updates` compares the `$Version` line in the installed script against
 the copy published at `$RawUrl`. A blue dot appears when a newer one exists;
 accepting it backs the current file up as `TsakasOptimizer.ps1.bak`, writes the new
-version and restarts.
+version and restarts. It also refreshes the files that ship beside the script
+(the icon) and repoints the shortcuts, so an in-app update matches a fresh
+install.
 
 To publish your own build, set `$Repo` at the top of `TsakasOptimizer.ps1` to your
 repo (`owner/name`), then bump `$Version` with every release.
