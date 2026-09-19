@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.4.3'
+$Version = '1.4.4'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -389,6 +389,9 @@ function Invoke-Undo {
         'NetProperty' {
           Set-NetAdapterAdvancedProperty -Name $e.Adapter -DisplayName $e.Name -DisplayValue $e.Previous -ErrorAction Stop
         }
+        'TcpipReg' {
+          New-ItemProperty -Path $TcpipKey -Name $e.Name -Value ([int]$e.Previous) -PropertyType DWord -Force | Out-Null
+        }
         'NetPower' {
           $pm = Get-NetAdapterPowerManagement -Name $e.Adapter -ErrorAction Stop
           $pm.AllowComputerToTurnOffDevice = $e.Previous
@@ -734,6 +737,21 @@ function Get-DriverNote([string]$Provider, $Date) {
 # running from battery.
 $NetPowerProps = 'Energy.Efficient|Advanced EEE|Green Ethernet|Gigabit Lite|Power Saving|Selective Suspend|Ultra Low Power|Idle Power|Reduce Speed|Auto Disable|Energy Detect'
 
+# Trade CPU time for latency. Microsoft's adapter tuning guide suggests interrupt
+# moderation off for the lowest latency; checksum offload off helps on some
+# adapter firmware and does nothing on others. Offered, never assumed.
+# Large Send Offload and Receive Segment Coalescing only touch TCP, not the UDP
+# games use, so they are left alone.
+$NetLatencyProps = '^Interrupt Moderation$|Checksum Offload'
+
+$TcpipKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+
+function Get-NetGroup([string]$DisplayName) {
+  if ($DisplayName -match $NetPowerProps)   { return 'Power saving' }
+  if ($DisplayName -match $NetLatencyProps) { return 'Latency (optional)' }
+  return $null
+}
+
 $NetWhy = @{
   'Energy-Efficient Ethernet' = 'Powers the link down between packets. Saves under a watt, and is a known cause of latency spikes and dropped links.'
   'Advanced EEE'              = 'Aggressive version of the same link power saving. Same trade, worse.'
@@ -741,12 +759,14 @@ $NetWhy = @{
   'Gigabit Lite'              = 'Runs the link in a lower-power mode. Can drop you to a slower speed.'
   'Power Saving Mode'         = 'Vendor power saving for the adapter. Trades latency for a trivial amount of power.'
   'Selective Suspend'         = 'Lets Windows suspend the adapter when idle. It wakes late, so the first packet after a pause is slow.'
+  'Interrupt Moderation'      = 'Groups several packets into one interrupt to save CPU, which adds a few microseconds before each batch is handled. Microsoft suggests turning it off for the lowest latency; the cost is more CPU time. Optional - test your games with it off before keeping it.'
 }
+$NetChecksumWhy = 'Lets the network card check packets instead of the CPU. Off moves that work back to the CPU. Some adapter firmware handles offloads badly, so this can help, but on a good driver it changes nothing. Optional - test before keeping it.'
 
 # Returns the value to set it to, or $null when the property is not a simple
 # on/off switch or is already off.
 function Get-NetOffValue([string]$DisplayName, [string]$Current, $ValidValues) {
-  if ($DisplayName -notmatch $NetPowerProps) { return $null }
+  if (-not (Get-NetGroup $DisplayName)) { return $null }
   $off = @($ValidValues) | Where-Object { $_ -match '^\s*(Disabled|Off)\s*$' } | Select-Object -First 1
   if (-not $off) { return $null }                          # e.g. "EEE Max Support Speed" is a speed list
   if ($Current -match '^\s*(Disabled|Off)\s*$') { return $null }
@@ -759,23 +779,37 @@ function Get-NetFindings {
     foreach ($p in @(Get-NetAdapterAdvancedProperty -Name $a.Name -ErrorAction SilentlyContinue)) {
       $off = Get-NetOffValue $p.DisplayName $p.DisplayValue $p.ValidDisplayValues
       if (-not $off) { continue }
+      $group = Get-NetGroup $p.DisplayName
       $why = $NetWhy[$p.DisplayName]
+      if (-not $why -and $p.DisplayName -match 'Checksum') { $why = $NetChecksumWhy }
       if (-not $why) { $why = 'Adapter power saving. Turning it off keeps the link up and responsive.' }
       [void]$rows.Add([pscustomobject]@{
         Kind = 'Property'; Adapter = $a.Name; Setting = $p.DisplayName
-        Current = $p.DisplayValue; Target = $off; Why = $why
+        Current = $p.DisplayValue; Target = $off; Why = $why; Group = $group
       })
     }
     $pm = try { Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction Stop } catch { $null }
     if ($pm -and $pm.AllowComputerToTurnOffDevice -eq 'Enabled') {
       [void]$rows.Add([pscustomobject]@{
         Kind = 'Power'; Adapter = $a.Name; Setting = 'Allow the computer to turn off this device'
-        Current = 'Enabled'; Target = 'Disabled'
+        Current = 'Enabled'; Target = 'Disabled'; Group = 'Power saving'
         Why = 'Windows may power the adapter down to save energy. This is the classic cause of "the internet drops after the PC has been idle".'
       })
     }
   }
-  $rows
+
+  # a leftover from old tweak guides that switches every offload off system-wide
+  $dto = (Get-ItemProperty $TcpipKey -ErrorAction SilentlyContinue).DisableTaskOffload
+  if ($dto -eq 1) {
+    [void]$rows.Add([pscustomobject]@{
+      Kind = 'TaskOffload'; Adapter = 'All adapters'; Setting = 'DisableTaskOffload (registry)'
+      Current = '1'; Target = 'Removed'; Group = 'Repair'
+      Why = 'A leftover tweak that turns off every offload for the whole system. It also stops Receive Side Scaling from spreading network work across CPU cores. Removing it restores the Windows default. Takes effect after a restart.'
+    })
+  }
+
+  $order = @{ 'Repair' = 0; 'Power saving' = 1; 'Latency (optional)' = 2 }
+  $rows | Sort-Object { $order[$_.Group] }
 }
 
 function Get-NetNotes {
@@ -791,7 +825,29 @@ function Get-NetNotes {
     if (-not $pm) {
       [void]$n.Add('    [i] Windows could not read this adapter power settings (some Realtek drivers refuse). Check them by hand: Device Manager, the adapter, Power Management tab.')
     }
+
+    # Receive Side Scaling spreads network work across CPU cores
+    $rss = try { Get-NetAdapterRss -Name $a.Name -ErrorAction Stop } catch { $null }
+    if (-not $rss) {
+      [void]$n.Add('    [i] RSS: this adapter or its driver does not offer Receive Side Scaling, so network work stays on one core. Fine for gaming; the chip maker''s latest driver sometimes adds it.')
+    } elseif (-not $rss.Enabled) {
+      [void]$n.Add('    [!] RSS is turned off. Network work is stuck on one core - turn Receive Side Scaling back on in the adapter''s Advanced tab.')
+    } elseif (@($rss.IndirectionTable).Count -eq 0) {
+      [void]$n.Add('    [!] RSS is on but its indirection table is empty, so connections are not being mapped to cores. Usually a DisableTaskOffload leftover or a filter driver (for example ExitLag in filter mode instead of WFP).')
+    } else {
+      [void]$n.Add(("    [ok] RSS: on, {0} queue(s), processors {1}-{2}, profile {3}." -f $rss.NumberOfReceiveQueues, $rss.BaseProcessorNumber, $rss.MaxProcessorNumber, $rss.Profile))
+    }
+
+    $rb = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Receive Buffers' -ErrorAction SilentlyContinue).DisplayValue
+    $tb = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Transmit Buffers' -ErrorAction SilentlyContinue).DisplayValue
+    if ($rb -or $tb) {
+      [void]$n.Add(("    [i] Buffers: receive {0}, transmit {1}. Lower values can cut queued work, but too low drops packets in bursts. Only lower them if you are chasing stutter, and test each step." -f $(if ($rb) { $rb } else { '-' }), $(if ($tb) { $tb } else { '-' })))
+    }
   }
+  [void]$n.Add('')
+  [void]$n.Add('Driver: install the network driver from the chip maker (Intel, Realtek, Marvell), not the motherboard page - RSS often only works properly with the chip maker''s latest driver.')
+  [void]$n.Add('Manual only: pinning network interrupts and RSS queues to specific CPU cores can help competitive games, but the right cores depend on your CPU (performance vs efficiency cores, SMT). It is left out on purpose.')
+  [void]$n.Add('Latency options follow Microsoft''s network adapter performance tuning guide.')
   [void]$n.Add('')
   [void]$n.Add('Applying a change briefly resets the adapter, so the connection drops for a second or two. Do not do it mid-download, and never over a remote desktop session you cannot afford to lose.')
   [void]$n.Add('On a laptop running from battery, leave these alone - that is what they are for.')
@@ -800,7 +856,11 @@ function Get-NetNotes {
 
 function Invoke-NetFix($Row) {
   if (-not (Test-Admin)) { throw 'needs Administrator' }
-  if ($Row.Kind -eq 'Property') {
+  if ($Row.Kind -eq 'TaskOffload') {
+    Add-UndoEntry ([pscustomobject]@{
+      Type = 'TcpipReg'; Name = 'DisableTaskOffload'; Previous = $Row.Current; When = (Get-Date).ToString('s') })
+    Remove-ItemProperty -Path $TcpipKey -Name DisableTaskOffload -ErrorAction Stop
+  } elseif ($Row.Kind -eq 'Property') {
     Add-UndoEntry ([pscustomobject]@{
       Type = 'NetProperty'; Adapter = $Row.Adapter; Name = $Row.Setting
       Previous = $Row.Current; When = (Get-Date).ToString('s') })
@@ -1523,7 +1583,7 @@ function Show-Gui {
   $nlv.Anchor = 'Top,Left,Right'
   $nlv.BorderStyle = 'FixedSingle'
   $nlv.BackColor = [Drawing.Color]::White
-  foreach ($c in @(@('Adapter', 120), @('Setting', 280), @('Now', 100), @('Change to', 100), @('', 180))) {
+  foreach ($c in @(@('Adapter', 120), @('Setting', 260), @('Now', 110), @('Change to', 100), @('Group', 170))) {
     [void]$nlv.Columns.Add($c[0], $c[1])
   }
   $tab4.Controls.Add($nlv)
@@ -1548,12 +1608,13 @@ function Show-Gui {
 
   $loadNet = {
     $nlv.Items.Clear()
-    foreach ($r in @(Get-NetFindings)) {
+    $netRows = @(Get-NetFindings)
+    foreach ($r in $netRows) {
       $it = New-Object Windows.Forms.ListViewItem($r.Adapter)
       [void]$it.SubItems.Add($r.Setting)
       [void]$it.SubItems.Add($r.Current)
       [void]$it.SubItems.Add($r.Target)
-      [void]$it.SubItems.Add('')
+      [void]$it.SubItems.Add($r.Group)
       $it.Tag = $r
       [void]$nlv.Items.Add($it)
     }
@@ -1564,9 +1625,13 @@ function Show-Gui {
     $ntextCard.Height = $(if ($nlv.Visible) { 240 } else { 440 })
 
     $head = if ($nlv.Items.Count -eq 0) {
-      'Nothing to change - every power saving setting this tool checks is already off.'
+      'Nothing to change - every power saving and latency setting this tool checks is already off.'
     } else {
-      "{0} setting(s) worth turning off. Tick and press Apply.{1}" -f $nlv.Items.Count,
+      $parts = foreach ($g in 'Repair', 'Power saving', 'Latency (optional)') {
+        $c = @($netRows | Where-Object { $_.Group -eq $g }).Count
+        if ($c) { "{0} {1}" -f $c, $g.ToLower() }
+      }
+      "Found: {0}. Power saving is worth turning off on a desktop; latency options trade CPU time for response, so test them. Tick and press Apply.{1}" -f ($parts -join ', '),
         $(if (Test-Admin) { '' } else { '  Needs administrator - use the button on the first tab.' })
     }
     $ntext.Text = $head + "`r`n`r`n" + ((Get-NetNotes) -join "`r`n")
@@ -1764,6 +1829,14 @@ function Invoke-SelfTest {
     @{N = 'unrelated settings are left alone';    R = ($null -eq (Get-NetOffValue 'Jumbo Frame' 'Enabled' @('Disabled','Enabled')))}
     @{N = 'wake-on-lan is left alone';            R = ($null -eq (Get-NetOffValue 'Wake on Magic Packet' 'Enabled' @('Disabled','Enabled')))}
     @{N = 'Off counts as off';                    R = ($null -eq (Get-NetOffValue 'Power Saving Mode' 'Off' @('Off','On')))}
+    @{N = 'interrupt moderation is offered';      R = ((Get-NetOffValue 'Interrupt Moderation' 'Enabled' @('Disabled','Enabled')) -eq 'Disabled')}
+    @{N = 'moderation rate is not a toggle';      R = ($null -eq (Get-NetOffValue 'Interrupt Moderation Rate' 'Adaptive' @('Adaptive','Extreme','High','Low','Minimal','Off')))}
+    @{N = 'checksum offload is offered';          R = ((Get-NetOffValue 'TCP Checksum Offload (IPv4)' 'Rx & Tx Enabled' @('Disabled','Tx Enabled','Rx Enabled','Rx & Tx Enabled')) -eq 'Disabled')}
+    @{N = 'Intel checksum name matches too';      R = ((Get-NetOffValue 'TCP/UDP Checksum Offload (IPv6)' 'Rx & Tx Enabled' @('Disabled','Rx & Tx Enabled')) -eq 'Disabled')}
+    @{N = 'large send offload is left alone';     R = ($null -eq (Get-NetOffValue 'Large Send Offload v2 (IPv4)' 'Enabled' @('Disabled','Enabled')))}
+    @{N = 'segment coalescing is left alone';     R = ($null -eq (Get-NetOffValue 'Recv Segment Coalescing (IPv4)' 'Enabled' @('Disabled','Enabled')))}
+    @{N = 'power saving sorts as power saving';   R = ((Get-NetGroup 'Green Ethernet') -eq 'Power saving')}
+    @{N = 'checksum sorts as optional latency';   R = ((Get-NetGroup 'UDP Checksum Offload (IPv6)') -eq 'Latency (optional)')}
     @{N = 'network scan runs without error';      R = ((@(Get-NetFindings)).Count -ge 0)}
     # motherboard tab
     @{N = 'a 2 year old BIOS is flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-24);AgeMonths=24;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'over 18 months old'}

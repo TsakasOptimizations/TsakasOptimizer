@@ -79,6 +79,22 @@ for the detected platform. Read-only - it never touches the BIOS.
 Windows does not expose live memory timings, so the timings shown come from the
 SPD/rated profile. Verify the loaded values in BIOS, ZenTimings or CPU-Z.
 
+**Network tab.** Three groups, each change undoable:
+
+- *Power saving* - Energy-Efficient Ethernet, Green Ethernet, adapter power
+  saving and "allow the computer to turn off this device". Worth turning off on
+  a desktop.
+- *Latency (optional)* - Interrupt Moderation and TCP/UDP checksum offload.
+  Turning them off trades CPU time for response; test before keeping them.
+- *Repair* - a leftover `DisableTaskOffload` registry value that turns every
+  offload off and stops Receive Side Scaling from working.
+
+It also reports Receive Side Scaling status, receive/transmit buffers and the
+negotiated link speed. Large Send Offload and Receive Segment Coalescing are
+left alone because they only affect TCP, not the UDP traffic games use, and
+pinning interrupts to specific CPU cores is left as a manual step because the
+right cores depend on the CPU.
+
 ## Switches
 
 | Switch | What it does |
