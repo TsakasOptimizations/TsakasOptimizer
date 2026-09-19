@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.4.4'
+$Version = '1.5.0'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -148,6 +148,26 @@ $IconB64 = @(
   'EHfv3uNfvn/+5ReUnzqLQbGjOc+SENpgtIeS5wma09RGwcUhbVoUp2fOVjBH4krWf/DgIYRHj35mJaTou+9v84s7d+5ygTV20myERr7C9b1MHv',
   'xc4EqfnsH840WXbgMweXoG11B37t5jbsSR+BHnh48e4d90R5BHxF1bdQAAAABJRU5ErkJggg=='
 ) -join ''
+
+# The embedded .ico stores each size as a PNG. Icon.ToBitmap() cannot decode
+# those, so this pulls the PNG bytes for one size straight out of the directory.
+function Get-AppIconBitmap([int]$Size) {
+  try {
+    $bytes = [Convert]::FromBase64String($IconB64)
+    $count = [BitConverter]::ToUInt16($bytes, 4)
+    for ($i = 0; $i -lt $count; $i++) {
+      $entry = 6 + 16 * $i
+      $w = [int]$bytes[$entry]; if ($w -eq 0) { $w = 256 }
+      if ($w -ne $Size) { continue }
+      $len = [BitConverter]::ToInt32($bytes, $entry + 8)
+      $off = [BitConverter]::ToInt32($bytes, $entry + 12)
+      $png = New-Object byte[] $len
+      [Array]::Copy($bytes, $off, $png, 0, $len)
+      return [Drawing.Image]::FromStream((New-Object IO.MemoryStream(,$png)))
+    }
+  } catch { }
+  return $null
+}
 
 function Get-AppIcon {
   try {
@@ -982,10 +1002,10 @@ function Shift-Color($C, [int]$Amount) {
     [Math]::Max(0, [Math]::Min(255, [int]$C.B + $Amount)))
 }
 
-# Painted by hand: vertical gradient, a sheen over the top half, a defined edge.
-# $Bg is whatever sits behind the button, so the rounded corners can be
-# antialiased against it instead of clipped square by a region.
-function Set-Glossy($Btn, $Top, $Bottom, $Border, $Fore, $Bg, [int]$Radius) {
+# Flat button painted by hand. $Bg is whatever sits behind it, so the rounded
+# corners antialias against it instead of being clipped square by a region. The
+# border darkens toward the bottom edge, which is what gives it a little lift.
+function Set-FluentButton($Btn, $Fill, $Border, $Fore, $Bg, [int]$Radius) {
   $Btn.FlatStyle = 'Flat'
   $Btn.FlatAppearance.BorderSize = 0
   $Btn.FlatAppearance.MouseOverBackColor = $Bg
@@ -995,6 +1015,8 @@ function Set-Glossy($Btn, $Top, $Bottom, $Border, $Fore, $Bg, [int]$Radius) {
   $Btn.UseVisualStyleBackColor = $false
   $Btn.Region = $null
   $state = New-Object psobject -Property @{ Hot = $false; Down = $false }
+  # light fills darken on hover, dark fills lighten
+  $light = ([int]$Fill.R + $Fill.G + $Fill.B) -gt 600
 
   $Btn.Add_MouseEnter({ $state.Hot = $true;  $Btn.Invalidate() }.GetNewClosure())
   $Btn.Add_MouseLeave({ $state.Hot = $false; $state.Down = $false; $Btn.Invalidate() }.GetNewClosure())
@@ -1005,43 +1027,25 @@ function Set-Glossy($Btn, $Top, $Bottom, $Border, $Fore, $Bg, [int]$Radius) {
     param($s, $e)
     $g = $e.Graphics
     $g.Clear($Bg)
-    if (-not $s.Enabled) { return }
     $g.SmoothingMode = 'AntiAlias'
     $rect = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
     $path = New-RoundPath $rect $Radius
 
-    $t = $Top; $b = $Bottom
-    if ($state.Down)     { $t = Shift-Color $Top -18; $b = Shift-Color $Bottom -18 }
-    elseif ($state.Hot)  { $t = Shift-Color $Top 10;  $b = Shift-Color $Bottom 10 }
-
-    $fill = New-Object Drawing.Drawing2D.LinearGradientBrush($rect, $t, $b, 90)
+    $f = $Fill
+    if ($state.Down)    { $f = Shift-Color $Fill $(if ($light) { -14 } else { -18 }) }
+    elseif ($state.Hot) { $f = Shift-Color $Fill $(if ($light) { -6 } else { 14 }) }
+    $fill = New-Object Drawing.SolidBrush($f)
     $g.FillPath($fill, $path)
 
-    $saved = $g.Clip
-    $g.SetClip($path)
-    $half = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), [int](($s.Height - 1) / 2))
-    if ($half.Height -gt 0) {
-      $sheen = New-Object Drawing.Drawing2D.LinearGradientBrush($half,
-        [Drawing.Color]::FromArgb(120, 255, 255, 255), [Drawing.Color]::FromArgb(18, 255, 255, 255), 90)
-      $g.FillRectangle($sheen, $half)
-      $sheen.Dispose()
-    }
-    $g.Clip = $saved
-
-    $pen = New-Object Drawing.Pen($Border, 1)
+    $edge = New-Object Drawing.Drawing2D.LinearGradientBrush($rect, $Border, (Shift-Color $Border -26), 90)
+    $pen = New-Object Drawing.Pen($edge, 1)
     $g.DrawPath($pen, $path)
 
-    $fmt = New-Object Drawing.StringFormat
-    $fmt.LineAlignment = 'Center'
-    $fmt.Alignment = $(if ($s.TextAlign -eq 'MiddleLeft') { 'Near' } else { 'Center' })
-    $fmt.FormatFlags = 'NoWrap'
-    $fmt.Trimming = 'EllipsisCharacter'
-    $pad = $(if ($s.TextAlign -eq 'MiddleLeft') { 12 } else { 0 })
-    $textRect = New-Object Drawing.RectangleF($pad, 0, ($s.Width - $pad), $s.Height)
-    $brush = New-Object Drawing.SolidBrush($s.ForeColor)
-    $g.DrawString($s.Text, $s.Font, $brush, $textRect, $fmt)
+    $fore = if ($s.Enabled) { $s.ForeColor } else { [Drawing.Color]::FromArgb(150, $s.ForeColor) }
+    [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $fore,
+      [Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine, EndEllipsis')
 
-    $fill.Dispose(); $pen.Dispose(); $brush.Dispose(); $path.Dispose(); $fmt.Dispose(); $brush.Dispose()
+    $fill.Dispose(); $edge.Dispose(); $pen.Dispose(); $path.Dispose()
   }.GetNewClosure())
 }
 
@@ -1089,8 +1093,8 @@ function Show-Gui {
   $form.Text = "TsakasOptimizer $Version"
   $icon = Get-AppIcon
   if ($icon) { $form.Icon = $icon }
-  $form.ClientSize = New-Object Drawing.Size(1040, 640)
-  $form.MinimumSize = New-Object Drawing.Size(960, 620)
+  $form.ClientSize = New-Object Drawing.Size(1060, 640)
+  $form.MinimumSize = New-Object Drawing.Size(980, 620)
   $form.StartPosition = 'CenterScreen'
 
   $accent = [Drawing.Color]::FromArgb(0, 113, 227)
@@ -1120,42 +1124,44 @@ function Show-Gui {
   $display = & $pickFamily 'Segoe UI Variable Display Semib' (& $pickFamily 'Segoe UI Semibold' 'Segoe UI')
   $form.Font = New-Object Drawing.Font($family, 10)
 
-  # the ground everything sits on, so glossy corners can blend into it
-  $btnEdge = [Drawing.Color]::FromArgb(188, 189, 196)
+  $btnEdge = [Drawing.Color]::FromArgb(209, 209, 214)
   $flat = {
     param($b, $primary)
     $b.Cursor = 'Hand'
     $b.Height = 34
     if ($primary) {
       $b.Font = New-Object Drawing.Font($semi, 10)
-      Set-Glossy $b ([Drawing.Color]::FromArgb(64, 150, 240)) ([Drawing.Color]::FromArgb(0, 105, 214)) `
-                 ([Drawing.Color]::FromArgb(0, 84, 173)) $white $panel 8
+      Set-FluentButton $b $accent (Shift-Color $accent -18) $white $panel 6
     } else {
-      Set-Glossy $b $white ([Drawing.Color]::FromArgb(226, 227, 233)) $btnEdge $ink $panel 8
+      Set-FluentButton $b $white $btnEdge $ink $panel 6
     }
   }
 
   # ---- sidebar ----
   $side = New-Object Windows.Forms.Panel
   $side.Location = New-Object Drawing.Point(0, 0)
-  $side.Size = New-Object Drawing.Size(208, 592)
+  $side.Size = New-Object Drawing.Size(228, 592)
   $side.Anchor = 'Top,Left,Bottom'
-  $side.BackColor = $white
-  $sideLine = $line
-  $side.Add_Paint({
-    param($s, $e)
-    $pen = New-Object Drawing.Pen($sideLine, 1)
-    $e.Graphics.DrawLine($pen, $s.Width - 1, 0, $s.Width - 1, $s.Height)
-    $pen.Dispose()
-  }.GetNewClosure())
+  $side.BackColor = $panel
   $form.Controls.Add($side)
+
+  $brandX = 20
+  $brandImage = Get-AppIconBitmap 32
+  if ($brandImage) {
+    $pic = New-Object Windows.Forms.PictureBox
+    $pic.Size = New-Object Drawing.Size(32, 32)
+    $pic.Location = New-Object Drawing.Point(18, 24)
+    $pic.Image = $brandImage
+    $side.Controls.Add($pic)
+    $brandX = 58
+  }
 
   $brand = New-Object Windows.Forms.Label
   $brand.Text = 'TsakasOptimizer'
-  $brand.Font = New-Object Drawing.Font($display, 14)
+  $brand.Font = New-Object Drawing.Font($display, 12.5)
   $brand.ForeColor = $ink
   $brand.AutoSize = $true
-  $brand.Location = New-Object Drawing.Point(20, 26)
+  $brand.Location = New-Object Drawing.Point($brandX, 22)
   $side.Controls.Add($brand)
 
   $verLabel = New-Object Windows.Forms.Label
@@ -1163,8 +1169,50 @@ function Show-Gui {
   $verLabel.Font = New-Object Drawing.Font($small, 9)
   $verLabel.ForeColor = $muted
   $verLabel.AutoSize = $true
-  $verLabel.Location = New-Object Drawing.Point(21, 52)
+  $verLabel.Location = New-Object Drawing.Point(($brandX + 1), ($brand.Bottom + 1))
   $side.Controls.Add($verLabel)
+
+  # Windows 11 Settings style navigation: a Fluent icon, a soft pill for the
+  # selected item and a short accent bar on its left edge
+  $iconFamily = & $pickFamily 'Segoe Fluent Icons' (& $pickFamily 'Segoe MDL2 Assets' $null)
+  $iconFont = if ($iconFamily) { New-Object Drawing.Font($iconFamily, 11) } else { $null }
+  $navFont = New-Object Drawing.Font($family, 10)
+  $navIcons = @([char]0xE9D9, [char]0xE964, [char]0xE950, [char]0xE968, [char]0xE8A9)
+  $navSelFill = [Drawing.Color]::FromArgb(232, 232, 237)
+  $navHoverFill = [Drawing.Color]::FromArgb(238, 238, 242)
+  $navState = New-Object psobject -Property @{ Selected = 0; Hover = -1 }
+
+  $navPaint = {
+    param($s, $e)
+    $g = $e.Graphics
+    $g.Clear($panel)
+    $g.SmoothingMode = 'AntiAlias'
+    $i = [int]$s.Tag
+    $sel = ($navState.Selected -eq $i)
+    if ($sel -or $navState.Hover -eq $i) {
+      $r = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+      $p = New-RoundPath $r 6
+      $b = New-Object Drawing.SolidBrush($(if ($sel) { $navSelFill } else { $navHoverFill }))
+      $g.FillPath($b, $p); $b.Dispose(); $p.Dispose()
+    }
+    if ($sel) {
+      $bar = New-Object Drawing.Rectangle(0, [int](($s.Height - 16) / 2), 3, 16)
+      $bp = New-RoundPath $bar 1
+      $bb = New-Object Drawing.SolidBrush($accent)
+      $g.FillPath($bb, $bp); $bb.Dispose(); $bp.Dispose()
+    }
+    $flags = [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, EndEllipsis, NoPadding'
+    $textX = 14
+    if ($iconFont) {
+      $ir = New-Object Drawing.Rectangle(14, 0, 22, $s.Height)
+      [Windows.Forms.TextRenderer]::DrawText($g, [string]$navIcons[$i], $iconFont, $ir, $(if ($sel) { $accent } else { $ink }), $flags)
+      $textX = 44
+    }
+    $tr = New-Object Drawing.Rectangle($textX, 0, ($s.Width - $textX - 6), $s.Height)
+    [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $navFont, $tr, $ink, $flags)
+  }.GetNewClosure()
+  $navEnter = { param($s, $e) $navState.Hover = [int]$s.Tag; $s.Invalidate() }.GetNewClosure()
+  $navLeave = { param($s, $e) if ($navState.Hover -eq [int]$s.Tag) { $navState.Hover = -1 }; $s.Invalidate() }.GetNewClosure()
 
   $sections = @(
     @{ Title = 'Processes and services'; Sub = 'Background apps and services worth closing, and the ones worth leaving alone' }
@@ -1179,7 +1227,7 @@ function Show-Gui {
   $bodies = @()
   for ($i = 0; $i -lt $sections.Count; $i++) {
     $pane = New-Object Windows.Forms.Panel
-    $pane.Location = New-Object Drawing.Point(208, 0)
+    $pane.Location = New-Object Drawing.Point(228, 0)
     $pane.Size = New-Object Drawing.Size(832, 592)
     $pane.Anchor = 'Top,Left,Right,Bottom'
     $pane.BackColor = $panel
@@ -1212,15 +1260,19 @@ function Show-Gui {
 
     $nav = New-Object Windows.Forms.Button
     $nav.Text = $sections[$i].Title
-    $nav.TextAlign = 'MiddleLeft'
-    $nav.Padding = New-Object Windows.Forms.Padding(10, 0, 0, 0)
-    $nav.Size = New-Object Drawing.Size(176, 34)
-    $nav.Location = New-Object Drawing.Point(16, (96 + $i * 40))
+    $nav.Size = New-Object Drawing.Size(200, 36)
+    $nav.Location = New-Object Drawing.Point(14, (92 + $i * 40))
     $nav.FlatStyle = 'Flat'
     $nav.FlatAppearance.BorderSize = 0
+    $nav.FlatAppearance.MouseOverBackColor = $panel
+    $nav.FlatAppearance.MouseDownBackColor = $panel
+    $nav.BackColor = $panel
+    $nav.UseVisualStyleBackColor = $false
     $nav.Cursor = 'Hand'
     $nav.Tag = $i
-    Set-Rounded $nav 8
+    $nav.Add_Paint($navPaint)
+    $nav.Add_MouseEnter($navEnter)
+    $nav.Add_MouseLeave($navLeave)
     $side.Controls.Add($nav)
 
     $panes  += $pane
@@ -1235,18 +1287,9 @@ function Show-Gui {
 
   $selectSection = {
     param($index)
-    for ($k = 0; $k -lt $panes.Count; $k++) {
-      $panes[$k].Visible = ($k -eq $index)
-      if ($k -eq $index) {
-        $navs[$k].BackColor = $accent
-        $navs[$k].ForeColor = $white
-        $navs[$k].Font = New-Object Drawing.Font($semi, 10)
-      } else {
-        $navs[$k].BackColor = $white
-        $navs[$k].ForeColor = $ink
-        $navs[$k].Font = New-Object Drawing.Font($family, 10)
-      }
-    }
+    for ($k = 0; $k -lt $panes.Count; $k++) { $panes[$k].Visible = ($k -eq $index) }
+    $navState.Selected = $index
+    foreach ($n in $navs) { $n.Invalidate() }
     $form.Cursor = 'WaitCursor'
     try {
       if ($index -eq 2 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true }
@@ -1304,7 +1347,7 @@ function Show-Gui {
   & $flat $btnApply $true
   $btnElev.Visible = -not (Test-Admin)
   $btnElev.Anchor = 'Bottom,Right'
-  $btnElev.Location = New-Object Drawing.Point(($form.ClientSize.Width - $btnElev.Width - 12), 462)
+  $btnElev.Location = New-Object Drawing.Point(($tab1.ClientSize.Width - $btnElev.Width - 12), 462)
 
   $refresh = {
     $lv.Items.Clear()
@@ -1333,7 +1376,7 @@ function Show-Gui {
   # ---- footer: contact on the left, update check on the right ----
   $footer = New-Object Windows.Forms.Panel
   $footer.Location = New-Object Drawing.Point(0, 592)
-  $footer.Size = New-Object Drawing.Size(1040, 48)
+  $footer.Size = New-Object Drawing.Size(1060, 48)
   $footer.Anchor = 'Left,Right,Bottom'
   $footer.BackColor = $panel
   $footerLine = $line
@@ -1528,7 +1571,7 @@ function Show-Gui {
   $blv.Anchor = 'Top,Left,Right'
   $blv.BorderStyle = 'FixedSingle'
   $blv.BackColor = [Drawing.Color]::White
-  foreach ($c in @(@('Part', 80), @('Device', 240), @('Provider', 150), @('Version', 110), @('Date', 80), @('Note', 270))) {
+  foreach ($c in @(@('Part', 76), @('Device', 220), @('Provider', 140), @('Version', 110), @('Date', 70), @('Note', 150))) {
     [void]$blv.Columns.Add($c[0], $c[1])
   }
   $tab3.Controls.Add($blv)
@@ -1760,6 +1803,66 @@ function Show-Gui {
     Set-Rounded $c 10
     Add-Hairline $c $line 10
   }
+
+  $headerFont = New-Object Drawing.Font($small, 9)
+  $drawHeader = {
+    param($s, $e)
+    $g = $e.Graphics
+    $b = New-Object Drawing.SolidBrush($white)
+    $g.FillRectangle($b, $e.Bounds); $b.Dispose()
+    $pen = New-Object Drawing.Pen($line, 1)
+    $g.DrawLine($pen, $e.Bounds.Left, ($e.Bounds.Bottom - 1), $e.Bounds.Right, ($e.Bounds.Bottom - 1)); $pen.Dispose()
+    $r = New-Object Drawing.Rectangle(($e.Bounds.X + 8), $e.Bounds.Y, [Math]::Max(0, $e.Bounds.Width - 12), $e.Bounds.Height)
+    [Windows.Forms.TextRenderer]::DrawText($g, $e.Header.Text, $headerFont, $r, $muted,
+      [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, EndEllipsis')
+  }.GetNewClosure()
+  # The last column takes whatever width is left. Space for the vertical scrollbar
+  # is always kept free, because rows load after this runs and the scrollbar
+  # would otherwise push the list into a horizontal scroll.
+  $fillLast = {
+    param($s, $e)
+    $n = $s.Columns.Count
+    if ($n -eq 0) { return }
+    $used = 0
+    for ($i = 0; $i -lt $n - 1; $i++) { $used += $s.Columns[$i].Width }
+    $room = $s.Width - $used - [Windows.Forms.SystemInformation]::VerticalScrollBarWidth - 2
+    $s.Columns[$n - 1].Width = [Math]::Max(60, $room)
+  }
+  foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
+    $l.OwnerDraw = $true
+    $l.Add_DrawColumnHeader($drawHeader)
+    $l.Add_DrawItem({ param($s, $e) $e.DrawDefault = $true })
+    $l.Add_DrawSubItem({ param($s, $e) $e.DrawDefault = $true })
+    $l.Add_Resize($fillLast)
+    & $fillLast $l $null
+  }
+
+  # Windows 11 touches: Explorer-style list rows, and a title bar the same colour
+  # as the window. Both need a couple of Win32 calls; if compiling them is blocked
+  # (locked-down PCs), the app just keeps the plain look.
+  try {
+    if (-not ('TsakasNative' -as [type])) {
+      Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TsakasNative {
+  [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+  public static extern int SetWindowTheme(IntPtr hWnd, string appName, string idList);
+  [DllImport("dwmapi.dll")]
+  public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+}
+'@
+    }
+    foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { [void][TsakasNative]::SetWindowTheme($l.Handle, 'Explorer', $null) }
+    $colorRef = { param($c) [int]$c.R -bor ([int]$c.G -shl 8) -bor ([int]$c.B -shl 16) }
+    $caption = & $colorRef $panel
+    $captionText = & $colorRef $ink
+    $round = 2
+    # 35 caption colour, 36 caption text, 33 corner preference - Windows 11 only, ignored elsewhere
+    [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 35, [ref]$caption, 4)
+    [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 36, [ref]$captionText, 4)
+    [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 33, [ref]$round, 4)
+  } catch { }
 
   & $selectSection 0
 
