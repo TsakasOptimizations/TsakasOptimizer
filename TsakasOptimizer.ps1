@@ -7,7 +7,25 @@
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
 
-$Version = '1.5.0'
+# PowerShell always gets a console and is DPI-unaware. The GUI wants neither: a
+# hidden console whichever way the script was started, and real pixels instead of
+# a window Windows stretches (and blurs) on a 125% or 150% display.
+if (-not ($Console -or $Report -or $Undo -or $SelfTest)) {
+  try {
+    Add-Type -Name Startup -Namespace Tsakas -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+'@
+    $wnd = [Tsakas.Startup]::GetConsoleWindow()
+    if ($wnd -ne [IntPtr]::Zero) { [void][Tsakas.Startup]::ShowWindow($wnd, 0) }   # SW_HIDE
+    # system-DPI aware, not per-monitor: WinForms cannot re-lay-out on a monitor
+    # change without a manifest, and a stretched second monitor beats a broken one
+    [void][Tsakas.Startup]::SetProcessDPIAware()
+  } catch { }
+}
+
+$Version = '1.8.0'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -388,19 +406,43 @@ function Test-Admin {
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Add-UndoEntry($Entry) {
-  $dir = Split-Path $UndoFile
-  if (-not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
-  $log = @()
-  if (Test-Path $UndoFile) { $log = @(Get-Content $UndoFile -Raw | ConvertFrom-Json) }
-  $log += $Entry
-  $log | ConvertTo-Json -Depth 4 | Out-File $UndoFile -Encoding utf8
+# Flattens whatever shape the file is in: a bare object, a proper array, or the
+# nested { value = (...); Count = n } wrappers older builds wrote.
+function Expand-UndoEntries($Node, $Sink) {
+  if ($null -eq $Node) { return }
+  if ($Node -is [System.Collections.IEnumerable] -and $Node -isnot [string]) {
+    foreach ($item in $Node) { Expand-UndoEntries $item $Sink }
+    return
+  }
+  $names = @($Node.PSObject.Properties.Name)
+  if ($names -contains 'Type') { [void]$Sink.Add($Node); return }
+  if ($names -contains 'value') { Expand-UndoEntries $Node.value $Sink }
+}
+
+function Read-UndoLog([string]$Path = $UndoFile) {
+  $entries = New-Object System.Collections.ArrayList
+  if (-not (Test-Path $Path)) { return @() }
+  $raw = (Get-Content $Path -Raw)
+  if (-not $raw -or -not $raw.Trim()) { return @() }
+  try { Expand-UndoEntries ($raw | ConvertFrom-Json) $entries } catch { }
+  return @($entries)
+}
+
+function Add-UndoEntry($Entry, [string]$Path = $UndoFile) {
+  $dir = Split-Path $Path
+  if ($dir -and -not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+  $log = New-Object System.Collections.ArrayList
+  foreach ($e in (Read-UndoLog $Path)) { [void]$log.Add($e) }
+  [void]$log.Add($Entry)
+  # -InputObject, because piping an array here is what nested the log in the first place
+  ConvertTo-Json -InputObject @($log) -Depth 5 | Out-File $Path -Encoding utf8
 }
 
 function Invoke-Undo {
   if (-not (Test-Path $UndoFile)) { Write-Host 'Nothing to undo.'; return }
   if (-not (Test-Admin)) { Write-Host 'Run as Administrator to restore services.' -ForegroundColor Yellow; return }
-  foreach ($e in @(Get-Content $UndoFile -Raw | ConvertFrom-Json)) {
+  $failed = New-Object System.Collections.ArrayList
+  foreach ($e in (Read-UndoLog)) {
     try {
       switch ($e.Type) {
         'AppStartup' {
@@ -422,9 +464,12 @@ function Invoke-Undo {
       Write-Host ("restored {0} -> {1}" -f $e.Name, $e.Previous) -ForegroundColor Green
     } catch {
       Write-Host ("could not restore {0}: {1}" -f $e.Name, $_.Exception.Message) -ForegroundColor Red
+      [void]$failed.Add($e)
     }
   }
-  Remove-Item $UndoFile
+  # keep whatever could not be restored, so a second attempt is still possible
+  if ($failed.Count -eq 0) { Remove-Item $UndoFile }
+  else { ConvertTo-Json -InputObject @($failed) -Depth 5 | Out-File $UndoFile -Encoding utf8 }
 }
 
 # --- scan --------------------------------------------------------------------
@@ -526,6 +571,13 @@ function Invoke-Finding($f) {
 # --- memory ------------------------------------------------------------------
 # Slot naming is board-specific (DIMM 0/1, DIMM_A1, ChannelA-DIMM1...). The raw
 # locator is always shown so it can be checked against the motherboard manual.
+# Desktop AM5 is Ryzen 7000/8000/9000 with a desktop suffix or none. Mobile parts
+# (7735HS, 7945HX) carry the same number ranges but are soldered laptop chips, and
+# the desktop memory advice does not apply to them.
+function Test-Am5([string]$Cpu) {
+  return ($Cpu -match '(?i)Ryzen\s+\d\s+[789]\d{3}(X3D|XT|X|GE|G|F)?(\s|$)')
+}
+
 function Get-DimmChannel([string]$Bank, [string]$Locator) {
   if ($Bank -match '(?i)channel\s*([A-D])')    { return $Matches[1].ToUpper() }
   if ($Locator -match '(?i)([A-D])\s*\d')      { return $Matches[1].ToUpper() }
@@ -551,6 +603,17 @@ function Get-PartTimings([string]$Part) {
     $cl = [int]$Matches[1]
   }
   [pscustomobject]@{ CL = $cl; tRCD = $trcd; tRP = $trp }
+}
+
+# G.SKILL F5-6000J..., Corsair CMK32GX5M2B6000C36, Kingston KHX3200C16 - the
+# rated transfer rate is in the part number, which is the only rating available
+# when the board reports Speed as whatever the memory is currently running at.
+function Get-PartSpeed([string]$Part) {
+  foreach ($m in [regex]::Matches(("$Part"), '(\d{4,5})')) {
+    $v = [int]$m.Groups[1].Value
+    if ($v -ge 1600 -and $v -le 12000) { return $v }
+  }
+  return 0
 }
 
 function Get-Dimms {
@@ -584,76 +647,82 @@ function Get-MemoryNotes([object[]]$Dimms, [int]$Slots, [string]$Cpu) {
     return $n
   }
 
-  $am5  = $Cpu -match 'Ryzen\s+\d\s+[79]\d{3}'   # Ryzen 7 7800X3D / Ryzen 9 9950X = AM5
+  $am5  = Test-Am5 $Cpu
   $ddr5 = $Dimms[0].Type -eq 'DDR5'
-  $rated = ($Dimms | Measure-Object Rated -Maximum).Maximum
-  $run   = ($Dimms | Measure-Object Running -Minimum).Minimum
+  $spdRated  = ($Dimms | Measure-Object Rated -Maximum).Maximum
+  $run       = ($Dimms | Measure-Object Running -Minimum).Minimum
+  $partRated = 0
+  foreach ($d in $Dimms) { $partRated = [Math]::Max($partRated, (Get-PartSpeed $d.Part)) }
+  $rated = [Math]::Max($spdRated, $partRated)
 
   # 1. EXPO / XMP
   if ($run -gt 0 -and $rated -gt 0 -and $run -lt ($rated - 50)) {
-    [void]$n.Add(("[!] EXPO/XMP is OFF. The kit is rated {0} MT/s but is running at {1} MT/s - about {2}% of what you paid for." -f $rated, $run, [math]::Round(100 * $run / $rated)))
-    [void]$n.Add('    Fix: BIOS -> EXPO (AMD) or XMP (Intel), pick Profile 1, save and reboot. Biggest single memory gain available to you.')
+    [void]$n.Add(("[!] EXPO/XMP is OFF: rated {0}, running {1} MT/s ({2}%). Fix in BIOS: EXPO (AMD) or XMP (Intel), Profile 1, save, reboot." -f $rated, $run, [math]::Round(100 * $run / $rated)))
   } elseif ($ddr5 -and $run -le 5600 -and $rated -le 5600) {
-    [void]$n.Add(("[i] Running at {0} MT/s, which is the JEDEC default. If the kit box says more (6000/6400), the EXPO profile is not being read - check BIOS." -f $run))
+    [void]$n.Add(("[i] Running {0} MT/s, the JEDEC default. If the box says 6000+, the profile is not loading - check BIOS." -f $run))
   } else {
-    [void]$n.Add(("[ok] EXPO/XMP looks enabled: rated {0} MT/s, running {1} MT/s." -f $rated, $run))
+    [void]$n.Add(("[ok] EXPO/XMP on: rated {0}, running {1} MT/s." -f $rated, $run))
+  }
+  if ($partRated -gt ($spdRated + 50)) {
+    [void]$n.Add(("    Rating read from the part number ({0}); this board only reports the running speed ({1})." -f $partRated, $spdRated))
   }
 
   # 2. slots
   $channels = @($Dimms | Group-Object Channel)
   if ($Dimms.Count -eq 2 -and $Slots -ge 4) {
     if ($channels.Count -lt 2) {
-      [void]$n.Add(("[!] Both sticks are in the same channel ({0}) - you are running single channel and losing roughly half your memory bandwidth." -f $channels[0].Name))
-      [void]$n.Add('    Fix: move one stick to the other channel (slots 2 and 4 counting from the CPU).')
+      [void]$n.Add(("[!] Both sticks in channel {0}: single channel, half the bandwidth. Move one to slot 2 or 4." -f $channels[0].Name))
     } elseif (($Dimms | Where-Object { $_.Slot -eq 2 }).Count -eq 2) {
-      [void]$n.Add('[ok] Two sticks, dual channel, both in the second slot of their channel (A2/B2) - that is 99% the correct placement.')
+      [void]$n.Add('[ok] Dual channel, both sticks in A2/B2. Correct placement.')
     } elseif (($Dimms | Where-Object { $_.Slot -eq 1 }).Count -eq 2) {
-      [void]$n.Add('[!] Both sticks look like they are in the FIRST slot of each channel (A1/B1).')
-      [void]$n.Add('    Fix: move them to slots 2 and 4 (A2/B2, furthest from the CPU). Boards are wired for that pair; A1/B1 often will not hold EXPO speeds.')
+      [void]$n.Add('[!] Sticks are in A1/B1. Move them to slots 2 and 4 (A2/B2) - A1/B1 often will not hold EXPO.')
     } else {
-      [void]$n.Add(('[i] Slot layout could not be read confidently: ' + (($Dimms | ForEach-Object { $_.Locator }) -join ' | ') + '. Check the manual - 2 sticks belong in slots 2 and 4.'))
+      [void]$n.Add(('[i] Slot layout unclear (' + (($Dimms | ForEach-Object { $_.Locator }) -join ' | ') + '). Two sticks belong in slots 2 and 4.'))
     }
+  } elseif ($Dimms.Count -eq 2 -and $Slots -eq 2) {
+    # two-slot boards (ITX, laptops) have no wrong pair to move to
+    $dual = $(if ($channels.Count -ge 2) { '[ok] Two-slot board, both filled: dual channel.' } else { '[!] Two-slot board but both sticks report one channel - check the manual.' })
+    [void]$n.Add($dual)
   } elseif ($Dimms.Count -eq 1) {
-    [void]$n.Add('[!] Only one stick: single channel. A second identical stick is the cheapest large gain for gaming and anything CPU-bound.')
+    [void]$n.Add('[!] One stick: single channel. A second identical stick is the cheapest big gain.')
   } elseif ($Dimms.Count -ge 4 -and $ddr5) {
-    [void]$n.Add('[i] Four DDR5 sticks: the memory controller usually cannot hold 6000+ with all four slots filled. 5600 or lower here is normal, not a fault.')
+    [void]$n.Add('[i] Four DDR5 sticks: 5600 or lower is normal here, not a fault.')
   }
 
   # 3. mixed kit
   if (($Dimms | Select-Object -ExpandProperty Part -Unique).Count -gt 1 -or
       ($Dimms | Select-Object -ExpandProperty GB   -Unique).Count -gt 1) {
-    [void]$n.Add('[!] The sticks are not identical. Mixed kits frequently fail to run their rated profile - if EXPO is unstable, this is the first suspect.')
+    [void]$n.Add('[!] Sticks are not identical. Mixed kits often miss their rated profile - first suspect if EXPO is unstable.')
   }
 
   # 4. platform target
   [void]$n.Add('')
-  [void]$n.Add('--- PROCEED WITH CAUTION - everything below is BIOS tuning. Wrong values mean no boot (fixable with a CMOS clear), and an unstable profile can corrupt data. Change one thing at a time. ---')
+  [void]$n.Add('--- PROCEED WITH CAUTION - BIOS tuning below. Wrong values mean no boot (clear CMOS to recover). One change at a time. ---')
   if ($am5 -and $ddr5) {
-    [void]$n.Add('[i] AM5 sweet spot is DDR5-6000 CL30 with FCLK 2000 and UCLK=MEMCLK (1:1). Past ~6400 the controller drops to 2:1 and usually gets slower, not faster.')
+    [void]$n.Add('[i] AM5 target: DDR5-6000 CL30, FCLK 2000, 1:1. Past ~6400 it drops to 2:1 and gets slower.')
   } elseif ($ddr5) {
-    [void]$n.Add('[i] Intel DDR5 scales further than AMD: 6400-7200 is reasonable if the board and kit allow it.')
+    [void]$n.Add('[i] Intel DDR5 target: 6400-7200 if the board and kit allow it.')
   } else {
-    [void]$n.Add('[i] DDR4 target: 3600 CL16 on Ryzen (1:1 with FCLK 1800), 3600-4000 on Intel.')
+    [void]$n.Add('[i] DDR4 target: 3600 CL16 on Ryzen (FCLK 1800, 1:1), 3600-4000 on Intel.')
   }
 
   # 5. timings
   $cl = ($Dimms | Where-Object { $_.CL } | Select-Object -First 1).CL
   if ($cl) {
-    [void]$n.Add(("[i] Part number decodes to CL{0}{1} at {2} MT/s (this is the rated SPD profile, not necessarily what is loaded)." -f
+    [void]$n.Add(("[i] Part number says CL{0}{1} at {2} MT/s (rated profile, not necessarily loaded)." -f
       $cl, $(if ($Dimms[0].tRCD) { "-$($Dimms[0].tRCD)-$($Dimms[0].tRP)" } else { '' }), $rated))
     if ($ddr5 -and $rated -ge 6000 -and $cl -ge 30) {
-      [void]$n.Add('    Tightening worth trying, one at a time: CL 30 -> 28, tRCD/tRP -> 36, tRAS -> 32, tRFC -> ~480ns (from the usual 560ns). VDD/VDDQ 1.35-1.40V.')
+      [void]$n.Add('    Tightening, one at a time: CL 30->28, tRCD/tRP->36, tRAS->32, tRFC ~480ns. VDD/VDDQ 1.35-1.40V. Worth 1-3%.')
     } elseif ($ddr5) {
-      [void]$n.Add('    Get the rated profile stable first; tightening below the rated CL is worth 1-3% at best.')
+      [void]$n.Add('    Get the rated profile stable first. Tightening past it is worth 1-3%.')
     } else {
-      [void]$n.Add('    On DDR4 the big ones are tCL, tRCD/tRP and tRFC. Samsung B-die tightens a lot, Hynix/Micron much less.')
+      [void]$n.Add('    DDR4: tCL, tRCD/tRP and tRFC matter most. B-die tightens far more than Hynix/Micron.')
     }
-    [void]$n.Add('    Realistic gain from tightening an already-correct EXPO profile: 1-3% in games, near zero elsewhere. Getting EXPO on at all is worth 10x that.')
   }
 
   [void]$n.Add('')
-  [void]$n.Add('Note: Windows does not expose live memory timings - the values above come from the SPD/rated profile. Read the actual loaded timings in BIOS, in ZenTimings (AM5) or the CPU-Z SPD tab.')
-  [void]$n.Add('Test any change with TestMem5 (anta777 config) or Karhu for at least an hour. If the PC will not boot, clear CMOS to get back to defaults.')
+  [void]$n.Add('Windows cannot read live timings - the values above are the SPD profile. Real ones: BIOS, ZenTimings (AM5) or CPU-Z SPD.')
+  [void]$n.Add('Test any change for an hour with TestMem5 (anta777) or Karhu.')
   [void]$n.Add('')
   [void]$n.Add('Need advice specific to your rig? Discord: _tsakas_  or X: @TsakasIoannis')
   return $n
@@ -683,22 +752,43 @@ function Get-BiosNotes($Board) {
   [void]$n.Add(("BIOS:  {0}, released {1:yyyy-MM-dd} ({2} months ago)" -f $Board.Bios, $Board.BiosDate, $Board.AgeMonths))
   [void]$n.Add('')
 
-  $am5 = $Board.Cpu -match 'Ryzen\s+\d\s+[79]\d{3}'
+  $am5 = Test-Am5 $Board.Cpu
   if ($Board.AgeMonths -lt 6) {
-    [void]$n.Add('[ok] That BIOS is recent. Nothing to do unless you are chasing a specific bug.')
+    [void]$n.Add('[ok] Recent BIOS. Nothing to do unless you are chasing a specific bug.')
   } elseif ($Board.AgeMonths -lt 18) {
-    [void]$n.Add('[i] A newer BIOS probably exists. Worth updating only if you have a reason: memory instability, a new CPU, or a fix listed in the changelog.')
+    [void]$n.Add('[i] A newer BIOS likely exists. Update only for a reason: memory instability, a new CPU, a fix in the changelog.')
   } else {
-    [void]$n.Add('[!] This BIOS is over 18 months old. Vendors ship real fixes in that time - check the changelog on the support page.')
+    [void]$n.Add('[!] BIOS is over 18 months old. Check the changelog on the support page.')
   }
   if ($am5) {
-    [void]$n.Add('    On AM5 specifically, BIOS updates carry AGESA versions that fix memory training and EXPO stability. If your RAM is fussy, this is the first thing to try.')
+    [void]$n.Add('    AM5: BIOS updates carry AGESA fixes for memory training and EXPO. First thing to try with fussy RAM.')
   }
   [void]$n.Add('')
-  [void]$n.Add('Windows cannot tell you which BIOS version is the newest - only the vendor page lists that. Use the button below, match your exact model, and compare against the version above.')
+  [void]$n.Add('Windows cannot tell you the newest version - only the vendor page can. Use the button below and match your exact model.')
   [void]$n.Add('')
-  [void]$n.Add('--- PROCEED WITH CAUTION - a failed BIOS flash can leave the board unbootable. Use the vendor tool (Q-Flash, M-Flash, EZ Flash), never flash on an unstable machine, and do not cut power during it. ---')
+  [void]$n.Add('--- PROCEED WITH CAUTION - a failed flash can leave the board unbootable. Use the vendor tool, never flash an unstable PC, do not cut power. ---')
   return $n
+}
+
+# Per-device chipset drivers (PCI, SMBus, GPIO and friends) each carry their own
+# small version number. What people mean by "chipset driver" is the installed
+# package, which lives in the uninstall registry - the same place the Settings
+# app reads it from.
+function Get-ChipsetPackage {
+  $keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+  $hits = @(Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match '(?i)chipset' -and $_.DisplayVersion })
+  if (-not $hits) { return $null }
+
+  # the same package is often registered twice; prefer the readable name
+  $named = @($hits | Where-Object { $_.DisplayName -notmatch '_' })
+  $name = $(if ($named) { $named[0].DisplayName } else { $hits[0].DisplayName })
+  $date = $null
+  foreach ($h in $hits) {
+    if ("$($h.InstallDate)" -match '^\d{8}$') { $date = [datetime]::ParseExact($h.InstallDate, 'yyyyMMdd', $null); break }
+  }
+  [pscustomobject]@{ Name = $name; Version = $hits[0].DisplayVersion; Publisher = $hits[0].Publisher; Date = $date }
 }
 
 # Only these classes matter here; the query is filtered server-side to keep it quick.
@@ -722,28 +812,52 @@ function Get-DriverInfo {
         Version = '-'; Date = $null; Note = 'Windows is using its own driver. The vendor one usually adds features and fixes.' })
       continue
     }
-    # chipset ships as one package, so report it as one line dated by its oldest piece
+    # chipset ships as one package, so report the package, not one of its devices
     if ($g.Cat -eq 'Chipset') {
       $oldest = $g.Rows | Sort-Object DriverDate | Select-Object -First 1
-      [void]$rows.Add([pscustomobject]@{
-        Category = 'Chipset'; Device = ("{0} chipset ({1} devices)" -f ($oldest.DriverProviderName -replace ',.*$', ''), $g.Rows.Count)
-        Provider = $oldest.DriverProviderName; Version = $oldest.DriverVersion; Date = $oldest.DriverDate
-        Note = (Get-DriverNote $oldest.DriverProviderName $oldest.DriverDate) })
+      $pkg = Get-ChipsetPackage
+      if ($pkg) {
+        [void]$rows.Add([pscustomobject]@{
+          Category = 'Chipset'; Device = ("{0} ({1} devices)" -f $pkg.Name, $g.Rows.Count)
+          Provider = $pkg.Publisher; Version = $pkg.Version; Date = $pkg.Date
+          Note = (Get-DriverNote $pkg.Publisher $pkg.Date) })
+      } else {
+        [void]$rows.Add([pscustomobject]@{
+          Category = 'Chipset'; Device = ("{0} chipset, oldest of {1} device drivers" -f ($oldest.DriverProviderName -replace ',.*$', ''), $g.Rows.Count)
+          Provider = $oldest.DriverProviderName; Version = $oldest.DriverVersion; Date = $oldest.DriverDate
+          Note = (Get-DriverNote $oldest.DriverProviderName $oldest.DriverDate) })
+      }
       continue
     }
     foreach ($d in $g.Rows) {
+      $inf = $d.InfName
+      $hwid = $(if ($d.HardWareID) { @($d.HardWareID)[0] } else { '' })
       [void]$rows.Add([pscustomobject]@{
         Category = $g.Cat; Device = $d.DeviceName; Provider = $d.DriverProviderName
-        Version = $d.DriverVersion; Date = $d.DriverDate; Note = (Get-DriverNote $d.DriverProviderName $d.DriverDate) })
+        Version = $d.DriverVersion; Date = $d.DriverDate
+        Note = (Get-DriverNote $d.DriverProviderName $d.DriverDate $inf $hwid) })
     }
   }
   $rows
 }
 
-function Get-DriverNote([string]$Provider, $Date) {
+function Get-DriverNote([string]$Provider, $Date, [string]$Inf, [string]$HardwareId) {
   $notes = @()
-  if ($Provider -like 'Microsoft*') { $notes += 'generic Windows driver - the vendor one usually adds features and fixes' }
-  if ($Date) {
+  if ($Provider -like 'Microsoft*') {
+    if ($Inf -match '(?i)^usbaudio') {
+      # the USB Audio class driver is the normal one; vendors rarely ship another
+      $notes += 'USB Audio class driver, which is the standard one for USB audio devices'
+    } elseif ($Inf -match '(?i)^hdaudio' -and $HardwareId -match '(?i)VEN_10DE') {
+      $notes += 'HDMI audio on the generic driver - NVIDIA ships one inside its display driver package'
+    } elseif ($Inf -match '(?i)^hdaudio' -and $HardwareId -match '(?i)VEN_1002') {
+      $notes += 'HDMI audio on the generic driver - AMD ships one inside its display driver package'
+    } else {
+      $notes += 'generic Windows driver - the vendor one usually adds features and fixes'
+    }
+  }
+  # Microsoft stamps inbox drivers 21 June 2006, so their age means nothing
+  $placeholder = $Date -and $Date.Year -eq 2006 -and $Date.Month -eq 6 -and $Date.Day -eq 21
+  if ($Date -and -not $placeholder) {
     $years = ((Get-Date) - $Date).TotalDays / 365
     if ($years -gt 3)     { $notes += 'over 3 years old' }
     elseif ($years -gt 2) { $notes += 'over 2 years old' }
@@ -838,22 +952,23 @@ function Get-NetNotes {
     [void]$n.Add(("{0}: {1}, link {2}, {3}" -f $a.Name, $a.InterfaceDescription, $a.LinkSpeed, $a.Status))
 
     $speeds = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Speed & Duplex' -ErrorAction SilentlyContinue).ValidDisplayValues
-    if ($speeds -and ($speeds -match '2\.5 Gbps') -and $a.LinkSpeed -like '1 Gbps*') {
-      [void]$n.Add('    [i] The adapter supports 2.5 Gbps but negotiated 1 Gbps. That is the switch or the cable, not a setting - you need a 2.5G port and cat5e or better.')
+    # $a.Speed is bits per second; LinkSpeed is a display string
+    if ($speeds -and ($speeds -match '2\.5 Gbps') -and $a.Speed -eq 1000000000) {
+      [void]$n.Add('    [i] Adapter supports 2.5 Gbps, negotiated 1 Gbps. That is the switch or the cable, not a setting.')
     }
     $pm = try { Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction Stop } catch { $null }
     if (-not $pm) {
-      [void]$n.Add('    [i] Windows could not read this adapter power settings (some Realtek drivers refuse). Check them by hand: Device Manager, the adapter, Power Management tab.')
+      [void]$n.Add('    [i] Power settings unreadable (common on Realtek). Check by hand: Device Manager, adapter, Power Management tab.')
     }
 
     # Receive Side Scaling spreads network work across CPU cores
     $rss = try { Get-NetAdapterRss -Name $a.Name -ErrorAction Stop } catch { $null }
     if (-not $rss) {
-      [void]$n.Add('    [i] RSS: this adapter or its driver does not offer Receive Side Scaling, so network work stays on one core. Fine for gaming; the chip maker''s latest driver sometimes adds it.')
+      [void]$n.Add('    [i] No RSS on this adapter or driver: network work stays on one core. Fine for gaming.')
     } elseif (-not $rss.Enabled) {
-      [void]$n.Add('    [!] RSS is turned off. Network work is stuck on one core - turn Receive Side Scaling back on in the adapter''s Advanced tab.')
+      [void]$n.Add('    [!] RSS off: network work stuck on one core. Turn it on in the adapter''s Advanced tab.')
     } elseif (@($rss.IndirectionTable).Count -eq 0) {
-      [void]$n.Add('    [!] RSS is on but its indirection table is empty, so connections are not being mapped to cores. Usually a DisableTaskOffload leftover or a filter driver (for example ExitLag in filter mode instead of WFP).')
+      [void]$n.Add('    [!] RSS on but its indirection table is empty - usually a DisableTaskOffload leftover or a filter driver (ExitLag in filter mode).')
     } else {
       [void]$n.Add(("    [ok] RSS: on, {0} queue(s), processors {1}-{2}, profile {3}." -f $rss.NumberOfReceiveQueues, $rss.BaseProcessorNumber, $rss.MaxProcessorNumber, $rss.Profile))
     }
@@ -861,16 +976,15 @@ function Get-NetNotes {
     $rb = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Receive Buffers' -ErrorAction SilentlyContinue).DisplayValue
     $tb = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Transmit Buffers' -ErrorAction SilentlyContinue).DisplayValue
     if ($rb -or $tb) {
-      [void]$n.Add(("    [i] Buffers: receive {0}, transmit {1}. Lower values can cut queued work, but too low drops packets in bursts. Only lower them if you are chasing stutter, and test each step." -f $(if ($rb) { $rb } else { '-' }), $(if ($tb) { $tb } else { '-' })))
+      [void]$n.Add(("    [i] Buffers: receive {0}, transmit {1}. Lower only if chasing stutter - too low drops packets in bursts." -f $(if ($rb) { $rb } else { '-' }), $(if ($tb) { $tb } else { '-' })))
     }
   }
   [void]$n.Add('')
-  [void]$n.Add('Driver: install the network driver from the chip maker (Intel, Realtek, Marvell), not the motherboard page - RSS often only works properly with the chip maker''s latest driver.')
-  [void]$n.Add('Manual only: pinning network interrupts and RSS queues to specific CPU cores can help competitive games, but the right cores depend on your CPU (performance vs efficiency cores, SMT). It is left out on purpose.')
+  [void]$n.Add('Driver: take it from the chip maker (Intel, Realtek, Marvell), not the motherboard page. RSS often needs their latest.')
   [void]$n.Add('Latency options follow Microsoft''s network adapter performance tuning guide.')
   [void]$n.Add('')
-  [void]$n.Add('Applying a change briefly resets the adapter, so the connection drops for a second or two. Do not do it mid-download, and never over a remote desktop session you cannot afford to lose.')
-  [void]$n.Add('On a laptop running from battery, leave these alone - that is what they are for.')
+  [void]$n.Add('Applying a change resets the adapter: the link drops for a second or two. Not mid-download, not over remote desktop.')
+  [void]$n.Add('On battery, leave these alone - that is what they are for.')
   return $n
 }
 
@@ -1041,6 +1155,15 @@ function Set-FluentButton($Btn, $Fill, $Border, $Fore, $Bg, [int]$Radius) {
     $pen = New-Object Drawing.Pen($edge, 1)
     $g.DrawPath($pen, $path)
 
+    # the focus ring: without it, tabbing through the app shows nothing at all
+    if ($s.Focused) {
+      $ring = New-Object Drawing.Rectangle(3, 3, ($s.Width - 7), ($s.Height - 7))
+      $rp = New-RoundPath $ring ([Math]::Max(1, $Radius - 2))
+      $rpen = New-Object Drawing.Pen($Fore, 1)
+      $g.DrawPath($rpen, $rp)
+      $rpen.Dispose(); $rp.Dispose()
+    }
+
     $fore = if ($s.Enabled) { $s.ForeColor } else { [Drawing.Color]::FromArgb(150, $s.ForeColor) }
     [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $fore,
       [Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine, EndEllipsis')
@@ -1049,13 +1172,149 @@ function Set-FluentButton($Btn, $Fill, $Border, $Fore, $Bg, [int]$Radius) {
   }.GetNewClosure())
 }
 
-# wraps a control in a padded white card and returns the card
-function Add-PaddedCard($Ctrl, [int]$Radius, $LineColor, [int]$Pad) {
+# Windows fixes both the width and the colour of a real scrollbar, so lists and
+# report panes hide theirs and get this drawn one instead: a 12px lane, a 6px
+# thumb that tracks the control's own scroll position, and no lane at all while
+# everything fits.
+function Add-SlimScrollbar($Ctrl, $Track, $Thumb, $ThumbHot, [double]$Scale = 1) {
+  $EM_GETLINECOUNT = 0x00BA; $EM_LINESCROLL = 0x00B6; $EM_GETFIRSTVISIBLELINE = 0x00CE
+  $LVM_GETTOPINDEX = 0x1027; $LVM_GETCOUNTPERPAGE = 0x1028
+  $isList = $Ctrl -is [Windows.Forms.ListView]
+
+  $Ctrl.Width = $Ctrl.Width - 16          # leave a lane for the bar
+  $arrowZone = [int](13 * $Scale)          # hit area for the little end arrows
+  $thumbW = [int](6 * $Scale)
+  $tri = [int](4 * $Scale)
+  $bar = New-Object Windows.Forms.Panel
+  $bar.Bounds = New-Object Drawing.Rectangle(($Ctrl.Right + 3), ($Ctrl.Top + 2), 12, ($Ctrl.Height - 4))
+  # never anchor left as well as right: an 8px bar stretched between both edges
+  # collapses to nothing when the window narrows
+  $anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+  if ($Ctrl.Anchor -band [Windows.Forms.AnchorStyles]::Bottom) { $anchor = $anchor -bor [Windows.Forms.AnchorStyles]::Bottom }
+  $bar.Anchor = $anchor
+  $bar.BackColor = $Track
+  $Ctrl.Parent.Controls.Add($bar)
+  $bar.BringToFront()
+
+  $st = New-Object psobject -Property @{ Hot = $false; Drag = $false; GrabY = 0; ThumbTop = 0; Last = '' }
+
+  # total rows, how many fit, and the first one showing
+  $metrics = {
+    if ($isList) {
+      $total = $Ctrl.Items.Count
+      $per   = [int][TsakasNative]::SendMessage($Ctrl.Handle, $LVM_GETCOUNTPERPAGE, [IntPtr]::Zero, [IntPtr]::Zero)
+      $first = [int][TsakasNative]::SendMessage($Ctrl.Handle, $LVM_GETTOPINDEX, [IntPtr]::Zero, [IntPtr]::Zero)
+    } else {
+      $total = [int][TsakasNative]::SendMessage($Ctrl.Handle, $EM_GETLINECOUNT, [IntPtr]::Zero, [IntPtr]::Zero)
+      $per   = [int]($Ctrl.ClientSize.Height / [Math]::Max(1, $Ctrl.Font.Height))
+      $first = [int][TsakasNative]::SendMessage($Ctrl.Handle, $EM_GETFIRSTVISIBLELINE, [IntPtr]::Zero, [IntPtr]::Zero)
+    }
+    @{ Total = [Math]::Max(1, $total); Per = [Math]::Max(1, $per); First = [Math]::Max(0, $first) }
+  }.GetNewClosure()
+
+  $trackTop    = { $arrowZone }.GetNewClosure()
+  $trackHeight = { [Math]::Max(1, ($bar.Height - 2 * $arrowZone)) }.GetNewClosure()
+  $thumbHeight = { param($m) [Math]::Max([int](22 * $Scale), [int]((& $trackHeight) * $m.Per / $m.Total)) }.GetNewClosure()
+
+  $scrollTo = {
+    param($line)
+    $m = & $metrics
+    $target = [Math]::Max(0, [Math]::Min([int]$line, ($m.Total - $m.Per)))
+    if ($isList) {
+      if ($Ctrl.Items.Count -gt 0) {
+        $Ctrl.EnsureVisible([Math]::Min(($Ctrl.Items.Count - 1), ($target + $m.Per - 1)))
+        $Ctrl.EnsureVisible($target)
+      }
+    } else {
+      [void][TsakasNative]::SendMessage($Ctrl.Handle, $EM_LINESCROLL, [IntPtr]::Zero, [IntPtr]($target - $m.First))
+    }
+  }.GetNewClosure()
+
+  $bar.Add_Paint({
+    param($s2, $e)
+    $m = & $metrics
+    $g = $e.Graphics
+    $g.Clear($Track)
+    if ($m.Total -le $m.Per) { return }        # everything fits: no bar at all
+    $g.SmoothingMode = 'AntiAlias'
+    $colour = $(if ($st.Hot -or $st.Drag) { $ThumbHot } else { $Thumb })
+
+    # thumb: 6px wide, centred in the lane, fully rounded ends
+    $h = & $thumbHeight $m
+    $st.ThumbTop = (& $trackTop) + [int](((& $trackHeight) - $h) * $m.First / ($m.Total - $m.Per))
+    # a capsule: round cap, straight body, round cap. New-RoundPath cannot do this
+    # shape, because its arcs collapse when the width equals twice the radius.
+    $x = [int]($s2.Width / 2) - [int]($thumbW / 2)
+    $b = New-Object Drawing.SolidBrush($colour)
+    $g.FillEllipse($b, $x, $st.ThumbTop, $thumbW, $thumbW)
+    $g.FillEllipse($b, $x, ($st.ThumbTop + $h - $thumbW), $thumbW, $thumbW)
+    $g.FillRectangle($b, $x, ($st.ThumbTop + [int]($thumbW / 2)), $thumbW, [Math]::Max(1, ($h - $thumbW)))
+
+    # a small triangle at each end
+    $mid = [int]($s2.Width / 2)
+    $up = @(
+      (New-Object Drawing.Point($mid, $tri)),
+      (New-Object Drawing.Point(($mid - $tri), ($tri * 2 + 1))),
+      (New-Object Drawing.Point(($mid + $tri), ($tri * 2 + 1))))
+    $down = @(
+      (New-Object Drawing.Point($mid, ($s2.Height - $tri))),
+      (New-Object Drawing.Point(($mid - $tri), ($s2.Height - $tri * 2 - 1))),
+      (New-Object Drawing.Point(($mid + $tri), ($s2.Height - $tri * 2 - 1))))
+    $g.FillPolygon($b, $up)
+    $g.FillPolygon($b, $down)
+    $b.Dispose()
+  }.GetNewClosure())
+
+  $bar.Add_MouseEnter({ $st.Hot = $true; $bar.Invalidate() }.GetNewClosure())
+  $bar.Add_MouseLeave({ $st.Hot = $false; $bar.Invalidate() }.GetNewClosure())
+  $bar.Add_MouseUp({ $st.Drag = $false; $bar.Invalidate() }.GetNewClosure())
+  $bar.Add_MouseDown({
+    param($s2, $e)
+    $m = & $metrics
+    if ($m.Total -le $m.Per) { return }
+    $h = & $thumbHeight $m
+    if ($e.Y -lt $arrowZone) { & $scrollTo ($m.First - 3); $bar.Invalidate(); return }
+    if ($e.Y -gt ($s2.Height - $arrowZone)) { & $scrollTo ($m.First + 3); $bar.Invalidate(); return }
+    if ($e.Y -ge $st.ThumbTop -and $e.Y -le ($st.ThumbTop + $h)) {
+      $st.Drag = $true
+      $st.GrabY = $e.Y - $st.ThumbTop
+      return
+    }
+    & $scrollTo (($e.Y - (& $trackTop) - $h / 2) * ($m.Total - $m.Per) / [Math]::Max(1, ((& $trackHeight) - $h)))
+    $bar.Invalidate()
+  }.GetNewClosure())
+  $bar.Add_MouseMove({
+    param($s2, $e)
+    if (-not $st.Drag) { return }
+    $m = & $metrics
+    $h = & $thumbHeight $m
+    & $scrollTo (($e.Y - $st.GrabY - (& $trackTop)) * ($m.Total - $m.Per) / [Math]::Max(1, ((& $trackHeight) - $h)))
+    $bar.Invalidate()
+  }.GetNewClosure())
+
+  # the control scrolls itself too (wheel, keys, selection), so keep the thumb in
+  # step; repaint only when something actually moved
+  $sync = {
+    if (-not $bar.IsHandleCreated) { return }
+    # the network list hides itself when there is nothing to show
+    # SB_BOTH: columns are sized to fit, so there is nothing to scroll sideways
+    if ($isList) { [void][TsakasNative]::ShowScrollBar($Ctrl.Handle, 3, $false) }
+    $m = & $metrics
+    $bar.Visible = $Ctrl.Visible -and ($m.Total -gt $m.Per)
+    $now = "$($m.Total)/$($m.Per)/$($m.First)"
+    if ($now -ne $st.Last) { $st.Last = $now; $bar.Invalidate() }
+  }.GetNewClosure()
+  $bar | Add-Member -NotePropertyName Sync -NotePropertyValue $sync
+  $bar
+}
+
+# wraps a control in a padded card and returns the card
+function Add-PaddedCard($Ctrl, [int]$Radius, $LineColor, [int]$Pad, $CardColor) {
   $card = New-Object Windows.Forms.Panel
   $card.Location = $Ctrl.Location
   $card.Size = $Ctrl.Size
   $card.Anchor = $Ctrl.Anchor
-  $card.BackColor = [Drawing.Color]::White
+  $card.BackColor = $CardColor
   $Ctrl.Parent.Controls.Add($card)
   $card.Controls.Add($Ctrl)
   $Ctrl.Location = New-Object Drawing.Point($Pad, $Pad)
@@ -1091,18 +1350,43 @@ function Show-Gui {
 
   $form = New-Object Windows.Forms.Form
   $form.Text = "TsakasOptimizer $Version"
+  # Fonts are in points and grow with the display on their own. Everything sized
+  # in pixels does not, so it is laid out at 100% and scaled once at the end.
+  $probe = $form.CreateGraphics()
+  $dpiScale = $probe.DpiX / 96
+  $probe.Dispose()
+  $sc = { param($n) [int][Math]::Round($n * $dpiScale) }
   $icon = Get-AppIcon
   if ($icon) { $form.Icon = $icon }
-  $form.ClientSize = New-Object Drawing.Size(1060, 640)
-  $form.MinimumSize = New-Object Drawing.Size(980, 620)
+  # Open large on a big screen, but never taller than the screen can show: a
+  # share of the working area, clamped between the layout minimum and a size
+  # that still looks deliberate rather than sprawling.
+  # in 100% units, because the whole layout is scaled at the end: the screen is
+  # already real pixels, so it is divided back out here and multiplied there
+  $area = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+  $roomW = [int](($area.Width - 40) / $dpiScale)
+  $roomH = [int](($area.Height - 60) / $dpiScale)
+  $form.ClientSize = New-Object Drawing.Size(
+    [Math]::Min($roomW, [Math]::Min(1600, [Math]::Max(1060, [int]($area.Width * 0.72 / $dpiScale)))),
+    [Math]::Min($roomH, [Math]::Min(1040, [Math]::Max(640,  [int]($area.Height * 0.82 / $dpiScale)))))
+  $form.MinimumSize = New-Object Drawing.Size([Math]::Min($roomW, 980), [Math]::Min($roomH, 620))
+
+  # one place the rest of the layout measures itself against
+  $sideW   = 228
+  $footerH = 48
+  $contentW = $form.ClientSize.Width - $sideW      # width of a section pane
+  $contentH = $form.ClientSize.Height - $footerH   # height above the footer
+  $ctlW = $contentW - 32                           # a card inside a pane, 12px margins plus room for its border
   $form.StartPosition = 'CenterScreen'
 
-  $accent = [Drawing.Color]::FromArgb(0, 113, 227)
-  $ink    = [Drawing.Color]::FromArgb(29, 29, 31)
-  $muted  = [Drawing.Color]::FromArgb(110, 110, 115)
-  $line   = [Drawing.Color]::FromArgb(210, 210, 215)
-  $panel  = [Drawing.Color]::FromArgb(245, 245, 247)
-  $white  = [Drawing.Color]::White
+  $accent = [Drawing.Color]::FromArgb(10, 132, 255)   # brighter than the light-theme blue, for contrast on black
+  $ink    = [Drawing.Color]::FromArgb(240, 240, 242)
+  $muted  = [Drawing.Color]::FromArgb(150, 150, 158)
+  $line   = [Drawing.Color]::FromArgb(42, 42, 48)
+  $panel  = [Drawing.Color]::FromArgb(15, 15, 17)      # matte black, not pure black
+  $card   = [Drawing.Color]::FromArgb(24, 24, 27)      # panels sit one step above the ground
+  $white  = [Drawing.Color]::White                     # only for text on the accent
+  $accentFill = [Drawing.Color]::FromArgb(0, 95, 184)  # white on this is 6.3:1; on $accent it is 3.7:1
   $form.BackColor = $panel
   $form.ForeColor = $ink
 
@@ -1124,31 +1408,92 @@ function Show-Gui {
   $display = & $pickFamily 'Segoe UI Variable Display Semib' (& $pickFamily 'Segoe UI Semibold' 'Segoe UI')
   $form.Font = New-Object Drawing.Font($family, 10)
 
-  $btnEdge = [Drawing.Color]::FromArgb(209, 209, 214)
+  $btnEdge = [Drawing.Color]::FromArgb(58, 58, 64)
   $flat = {
     param($b, $primary)
     $b.Cursor = 'Hand'
     $b.Height = 34
     if ($primary) {
       $b.Font = New-Object Drawing.Font($semi, 10)
-      Set-FluentButton $b $accent (Shift-Color $accent -18) $white $panel 6
+      Set-FluentButton $b $accentFill (Shift-Color $accentFill -18) $white $panel 6
     } else {
-      Set-FluentButton $b $white $btnEdge $ink $panel 6
+      Set-FluentButton $b ([Drawing.Color]::FromArgb(33, 33, 38)) $btnEdge $ink $panel 6
     }
+  }
+
+  # A message box is a system window and always paints light, so dialogs are
+  # built here instead. Returns the same DialogResult a message box would.
+  $dialog = {
+    param($text, $title, $buttons)
+    $d = New-Object Windows.Forms.Form
+    $d.Text = $title
+    $d.FormBorderStyle = 'FixedDialog'
+    $d.MaximizeBox = $false
+    $d.MinimizeBox = $false
+    $d.ShowInTaskbar = $false
+    $d.StartPosition = 'CenterParent'
+    $d.BackColor = $panel
+    $d.ForeColor = $ink
+    $d.Font = New-Object Drawing.Font($family, 10)
+
+    $lbl = New-Object Windows.Forms.Label
+    $lbl.Text = $text
+    $lbl.AutoSize = $true
+    $lbl.MaximumSize = New-Object Drawing.Size(460, 0)
+    $lbl.Location = New-Object Drawing.Point(24, 24)
+    $lbl.ForeColor = $ink
+    $d.Controls.Add($lbl)
+    $d.ClientSize = New-Object Drawing.Size([Math]::Max(360, ($lbl.Right + 24)), ($lbl.Bottom + 78))
+
+    $mkDlgButton = {
+      param($caption, $result, $primary, $x)
+      $b = New-Object Windows.Forms.Button
+      $b.Text = $caption
+      $b.Size = New-Object Drawing.Size(104, 34)
+      $b.Location = New-Object Drawing.Point($x, ($d.ClientSize.Height - 52))
+      $b.DialogResult = $result
+      & $flat $b $primary
+      $d.Controls.Add($b)
+      $b
+    }
+    if ($buttons -eq 'YesNo') {
+      $yes = & $mkDlgButton 'Yes' 'Yes' $true ($d.ClientSize.Width - 236)
+      $no  = & $mkDlgButton 'No'  'No'  $false ($d.ClientSize.Width - 124)
+      $d.AcceptButton = $yes
+      $d.CancelButton = $no
+    } else {
+      $ok = & $mkDlgButton 'OK' 'OK' $true ($d.ClientSize.Width - 124)
+      $d.AcceptButton = $ok
+      $d.CancelButton = $ok
+    }
+
+    try {
+      $dark = 1
+      $cap = [int]$panel.R -bor ([int]$panel.G -shl 8) -bor ([int]$panel.B -shl 16)
+      $txt = [int]$ink.R -bor ([int]$ink.G -shl 8) -bor ([int]$ink.B -shl 16)
+      [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 20, [ref]$dark, 4)
+      [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 35, [ref]$cap, 4)
+      [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 36, [ref]$txt, 4)
+    } catch { }
+
+    $result = $d.ShowDialog($form)
+    $d.Dispose()
+    $result
   }
 
   # ---- sidebar ----
   $side = New-Object Windows.Forms.Panel
   $side.Location = New-Object Drawing.Point(0, 0)
-  $side.Size = New-Object Drawing.Size(228, 592)
+  $side.Size = New-Object Drawing.Size($sideW, $contentH)
   $side.Anchor = 'Top,Left,Bottom'
   $side.BackColor = $panel
   $form.Controls.Add($side)
 
   $brandX = 20
-  $brandImage = Get-AppIconBitmap 32
+  $brandImage = Get-AppIconBitmap $(if ($dpiScale -ge 1.25) { 48 } else { 32 })
   if ($brandImage) {
     $pic = New-Object Windows.Forms.PictureBox
+    $pic.SizeMode = 'Zoom'
     $pic.Size = New-Object Drawing.Size(32, 32)
     $pic.Location = New-Object Drawing.Point(18, 24)
     $pic.Image = $brandImage
@@ -1178,8 +1523,8 @@ function Show-Gui {
   $iconFont = if ($iconFamily) { New-Object Drawing.Font($iconFamily, 11) } else { $null }
   $navFont = New-Object Drawing.Font($family, 10)
   $navIcons = @([char]0xE9D9, [char]0xE964, [char]0xE950, [char]0xE968, [char]0xE8A9)
-  $navSelFill = [Drawing.Color]::FromArgb(232, 232, 237)
-  $navHoverFill = [Drawing.Color]::FromArgb(238, 238, 242)
+  $navSelFill = [Drawing.Color]::FromArgb(38, 38, 44)
+  $navHoverFill = [Drawing.Color]::FromArgb(28, 28, 33)
   $navState = New-Object psobject -Property @{ Selected = 0; Hover = -1 }
 
   $navPaint = {
@@ -1196,21 +1541,29 @@ function Show-Gui {
       $g.FillPath($b, $p); $b.Dispose(); $p.Dispose()
     }
     if ($sel) {
-      $bar = New-Object Drawing.Rectangle(0, [int](($s.Height - 16) / 2), 3, 16)
+      $bar = New-Object Drawing.Rectangle(0, [int](($s.Height - (& $sc 16)) / 2), (& $sc 3), (& $sc 16))
       $bp = New-RoundPath $bar 1
       $bb = New-Object Drawing.SolidBrush($accent)
       $g.FillPath($bb, $bp); $bb.Dispose(); $bp.Dispose()
     }
-    $flags = [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, EndEllipsis, NoPadding'
-    $textX = 14
-    if ($iconFont) {
-      $ir = New-Object Drawing.Rectangle(14, 0, 22, $s.Height)
-      [Windows.Forms.TextRenderer]::DrawText($g, [string]$navIcons[$i], $iconFont, $ir, $(if ($sel) { $accent } else { $ink }), $flags)
-      $textX = 44
+    if ($s.Focused) {
+      $fr = New-Object Drawing.Rectangle(2, 2, ($s.Width - 5), ($s.Height - 5))
+      $fp = New-RoundPath $fr 5
+      $fpen = New-Object Drawing.Pen($ink, 1)
+      $g.DrawPath($fpen, $fp)
+      $fpen.Dispose(); $fp.Dispose()
     }
-    $tr = New-Object Drawing.Rectangle($textX, 0, ($s.Width - $textX - 6), $s.Height)
+    $flags = [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, EndEllipsis, NoPadding'
+    $textX = & $sc 14
+    if ($iconFont) {
+      $ir = New-Object Drawing.Rectangle((& $sc 14), 0, (& $sc 22), $s.Height)
+      [Windows.Forms.TextRenderer]::DrawText($g, [string]$navIcons[$i], $iconFont, $ir, $(if ($sel) { $accent } else { $ink }), $flags)
+      $textX = & $sc 44
+    }
+    $tr = New-Object Drawing.Rectangle($textX, 0, ($s.Width - $textX - (& $sc 6)), $s.Height)
     [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $navFont, $tr, $ink, $flags)
   }.GetNewClosure()
+  $navFocus = { param($s, $e) $s.Invalidate() }.GetNewClosure()
   $navEnter = { param($s, $e) $navState.Hover = [int]$s.Tag; $s.Invalidate() }.GetNewClosure()
   $navLeave = { param($s, $e) if ($navState.Hover -eq [int]$s.Tag) { $navState.Hover = -1 }; $s.Invalidate() }.GetNewClosure()
 
@@ -1227,8 +1580,8 @@ function Show-Gui {
   $bodies = @()
   for ($i = 0; $i -lt $sections.Count; $i++) {
     $pane = New-Object Windows.Forms.Panel
-    $pane.Location = New-Object Drawing.Point(228, 0)
-    $pane.Size = New-Object Drawing.Size(832, 592)
+    $pane.Location = New-Object Drawing.Point($sideW, 0)
+    $pane.Size = New-Object Drawing.Size($contentW, $contentH)
     $pane.Anchor = 'Top,Left,Right,Bottom'
     $pane.BackColor = $panel
     $pane.Visible = ($i -eq 0)
@@ -1253,7 +1606,7 @@ function Show-Gui {
     $bodyTop = $sub.Bottom + 8
     $body = New-Object Windows.Forms.Panel
     $body.Location = New-Object Drawing.Point(0, $bodyTop)
-    $body.Size = New-Object Drawing.Size(832, (592 - $bodyTop - 6))
+    $body.Size = New-Object Drawing.Size($contentW, ($contentH - $bodyTop - 6))
     $body.Anchor = 'Top,Left,Right,Bottom'
     $body.BackColor = $panel
     $pane.Controls.Add($body)
@@ -1271,6 +1624,8 @@ function Show-Gui {
     $nav.Cursor = 'Hand'
     $nav.Tag = $i
     $nav.Add_Paint($navPaint)
+    $nav.Add_GotFocus($navFocus)
+    $nav.Add_LostFocus($navFocus)
     $nav.Add_MouseEnter($navEnter)
     $nav.Add_MouseLeave($navLeave)
     $side.Controls.Add($nav)
@@ -1279,6 +1634,10 @@ function Show-Gui {
     $navs   += $nav
     $bodies += $body
   }
+  # every pane puts its buttons on the same baseline, measured from its own height
+  $bodyH   = $bodies[0].Height
+  $btnRowY = $bodyH - 42          # button row
+
   $tab1 = $bodies[0]
   $tab2 = $bodies[1]
   $tab3 = $bodies[2]
@@ -1302,10 +1661,10 @@ function Show-Gui {
   $lv = New-Object Windows.Forms.ListView
   $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false
   $lv.Location = New-Object Drawing.Point(12, 12)
-  $lv.Size = New-Object Drawing.Size(800, 330)
+  $lv.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 152))
   $lv.Anchor = 'Top,Left,Right,Bottom'
   $lv.BorderStyle = 'FixedSingle'
-  $lv.BackColor = [Drawing.Color]::White
+  $lv.BackColor = $card
   [void]$lv.Columns.Add('App Name', 330)
   [void]$lv.Columns.Add('Type', 70)
   [void]$lv.Columns.Add('RAM', 90)
@@ -1313,18 +1672,18 @@ function Show-Gui {
   $tab1.Controls.Add($lv)
 
   $details = New-Object Windows.Forms.TextBox
-  $details.Multiline = $true; $details.ReadOnly = $true; $details.BackColor = 'Window'
-  $details.Location = New-Object Drawing.Point(12, 352)
-  $details.Size = New-Object Drawing.Size(800, 56)
+  $details.Multiline = $true; $details.ReadOnly = $true; $details.BackColor = $card
+  $details.Location = New-Object Drawing.Point(12, ($btnRowY - 110))
+  $details.Size = New-Object Drawing.Size($ctlW, 56)
   $details.Anchor = 'Left,Right,Bottom'
   $details.BorderStyle = 'FixedSingle'
   $details.ForeColor = $muted
-  $details.Text = 'Scans the processes your CPU/PC runs. Suggests putting services on Manual instead of Automatic and closing unnessecary apps. Tick what you want changed, then press Apply.'
+  $details.Text = 'Scans the processes your CPU/PC runs. Suggests putting services on Manual instead of Automatic and closing apps you are not using. Tick what you want changed, then press Apply.'
   $tab1.Controls.Add($details)
 
   $status = New-Object Windows.Forms.Label
-  $status.Location = New-Object Drawing.Point(12, 418)
-  $status.Size = New-Object Drawing.Size(800, 40)
+  $status.Location = New-Object Drawing.Point(12, ($btnRowY - 44))
+  $status.Size = New-Object Drawing.Size($ctlW, 40)
   $status.Anchor = 'Left,Right,Bottom'
   $status.ForeColor = $muted
   $tab1.Controls.Add($status)
@@ -1333,7 +1692,7 @@ function Show-Gui {
     param($text, $x, $w)
     $b = New-Object Windows.Forms.Button
     $b.Text = $text
-    $b.Location = New-Object Drawing.Point($x, 462)
+    $b.Location = New-Object Drawing.Point($x, $btnRowY)
     $b.Size = New-Object Drawing.Size($w, 30)
     $b.Anchor = 'Left,Bottom'
     & $flat $b $false
@@ -1347,7 +1706,7 @@ function Show-Gui {
   & $flat $btnApply $true
   $btnElev.Visible = -not (Test-Admin)
   $btnElev.Anchor = 'Bottom,Right'
-  $btnElev.Location = New-Object Drawing.Point(($tab1.ClientSize.Width - $btnElev.Width - 12), 462)
+  $btnElev.Location = New-Object Drawing.Point(($tab1.ClientSize.Width - $btnElev.Width - 12), $btnRowY)
 
   $refresh = {
     $lv.Items.Clear()
@@ -1375,8 +1734,8 @@ function Show-Gui {
 
   # ---- footer: contact on the left, update check on the right ----
   $footer = New-Object Windows.Forms.Panel
-  $footer.Location = New-Object Drawing.Point(0, 592)
-  $footer.Size = New-Object Drawing.Size(1060, 48)
+  $footer.Location = New-Object Drawing.Point(0, $contentH)
+  $footer.Size = New-Object Drawing.Size($form.ClientSize.Width, $footerH)
   $footer.Anchor = 'Left,Right,Bottom'
   $footer.BackColor = $panel
   $footerLine = $line
@@ -1438,9 +1797,7 @@ function Show-Gui {
 
   $btnUpdate.Add_Click({
     if (-not $scriptPath) {
-      [void][Windows.Forms.MessageBox]::Show(
-        "You launched this straight from GitHub, so you are already on the latest version ($Version).",
-        'Up to date', 'OK', 'Information')
+      [void](& $dialog "You launched this straight from GitHub, so you are already on the latest version ($Version)." 'Up to date' 'OK')
       return
     }
     $btnUpdate.Enabled = $false
@@ -1448,26 +1805,22 @@ function Show-Gui {
     try { $script:online = Get-OnlineRelease } finally { $form.Cursor = 'Default'; $btnUpdate.Enabled = $true }
 
     if (-not $script:online) {
-      [void][Windows.Forms.MessageBox]::Show(
-        "Could not reach $Repo on GitHub. Check your connection, or download the latest copy yourself.",
-        'Update check failed', 'OK', 'Warning')
+      [void](& $dialog "Could not reach $Repo on GitHub. Check your connection, or download the latest copy yourself." 'Update check failed' 'OK')
       return
     }
     if ([version]$script:online.Version -le [version]$Version) {
       $dot.Visible = $false
-      [void][Windows.Forms.MessageBox]::Show("You are on the latest version ($Version).", 'Up to date', 'OK', 'Information')
+      [void](& $dialog "You are on the latest version ($Version)." 'Up to date' 'OK')
       return
     }
-    $ans = [Windows.Forms.MessageBox]::Show(
-      "Version $($script:online.Version) is available (you have $Version).`r`n`r`nDownload it and restart TsakasOptimizer?",
-      'Update available', 'YesNo', 'Question')
+    $ans = & $dialog "Version $($script:online.Version) is available (you have $Version).`r`n`r`nDownload it and restart TsakasOptimizer?" 'Update available' 'YesNo'
     if ($ans -ne 'Yes') { return }
     try {
       Install-Update $script:online.Text
-      Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
+      Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $scriptPath)
       $form.Close()
     } catch {
-      [void][Windows.Forms.MessageBox]::Show("Update failed: $($_.Exception.Message)", 'Update failed', 'OK', 'Error')
+      [void](& $dialog "Update failed: $($_.Exception.Message)" 'Update failed' 'OK')
     }
   })
 
@@ -1476,12 +1829,11 @@ function Show-Gui {
   $btnApply.Add_Click({
     $items = @($lv.CheckedItems)
     if ($items.Count -eq 0) {
-      [void][Windows.Forms.MessageBox]::Show('Tick at least one row first.', 'TsakasOptimizer')
+      [void](& $dialog 'Tick at least one row first.' 'TsakasOptimizer' 'OK')
       return
     }
     $names = ($items | ForEach-Object { $_.Tag.Label }) -join "`r`n"
-    $ans = [Windows.Forms.MessageBox]::Show(
-      "Apply to these $($items.Count) item(s)?`r`n`r`n$names", 'TsakasOptimizer', 'YesNo', 'Question')
+    $ans = & $dialog "Apply to these $($items.Count) item(s)?`r`n`r`n$names" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
 
     $freed = 0.0; $errs = @()
@@ -1504,7 +1856,7 @@ function Show-Gui {
 
   $btnElev.Add_Click({
     Start-Process powershell -Verb RunAs -ArgumentList @(
-      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $PSCommandPath)
     $form.Close()
   })
 
@@ -1512,21 +1864,21 @@ function Show-Gui {
   $mlv = New-Object Windows.Forms.ListView
   $mlv.View = 'Details'; $mlv.FullRowSelect = $true
   $mlv.Location = New-Object Drawing.Point(12, 12)
-  $mlv.Size = New-Object Drawing.Size(800, 130)
+  $mlv.Size = New-Object Drawing.Size($ctlW, 130)
   $mlv.Anchor = 'Top,Left,Right'
   $mlv.BorderStyle = 'FixedSingle'
-  $mlv.BackColor = [Drawing.Color]::White
+  $mlv.BackColor = $card
   foreach ($c in @(@('Slot', 170), @('Size', 60), @('Type', 60), @('Rated', 80), @('Running', 80), @('Timings', 90), @('Part', 230))) {
     [void]$mlv.Columns.Add($c[0], $c[1])
   }
   $tab2.Controls.Add($mlv)
 
   $mtext = New-Object Windows.Forms.TextBox
-  $mtext.Multiline = $true; $mtext.ReadOnly = $true; $mtext.ScrollBars = 'Vertical'
-  $mtext.BackColor = 'Window'
+  $mtext.Multiline = $true; $mtext.ReadOnly = $true; $mtext.ScrollBars = 'None'
+  $mtext.BackColor = $card
   $mtext.Font = New-Object Drawing.Font('Consolas', 9)
   $mtext.Location = New-Object Drawing.Point(12, 152)
-  $mtext.Size = New-Object Drawing.Size(800, 300)
+  $mtext.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 162))
   $mtext.Anchor = 'Top,Left,Right,Bottom'
   $mtext.BorderStyle = 'FixedSingle'
   $mtext.ForeColor = $ink
@@ -1534,7 +1886,7 @@ function Show-Gui {
 
   $btnCopy = New-Object Windows.Forms.Button
   $btnCopy.Text = 'Copy report'
-  $btnCopy.Location = New-Object Drawing.Point(12, 462)
+  $btnCopy.Location = New-Object Drawing.Point(12, $btnRowY)
   $btnCopy.Size = New-Object Drawing.Size(130, 30)
   $btnCopy.Anchor = 'Bottom,Left'
   & $flat $btnCopy $false
@@ -1558,8 +1910,9 @@ function Show-Gui {
       [void]$it.SubItems.Add("$($d.Vendor) $($d.Part)")
       [void]$mlv.Items.Add($it)
     }
-    $head = "{0} stick(s) in {1} slot(s)   CPU: {2}" -f $dimms.Count, $slots, $cpu
+    $head = "{0} stick(s) in {1} slot(s)   CPU: {2}" -f $dimms.Count, $slots, "$cpu".Trim()
     $mtext.Text = ($head, '', ((Get-MemoryNotes $dimms $slots $cpu) -join "`r`n")) -join "`r`n"
+    if ($fitList) { & $fitList $mlv $mtextCard 0.4 }
   }
   & $loadMemory
 
@@ -1567,28 +1920,28 @@ function Show-Gui {
   $blv = New-Object Windows.Forms.ListView
   $blv.View = 'Details'; $blv.FullRowSelect = $true
   $blv.Location = New-Object Drawing.Point(12, 12)
-  $blv.Size = New-Object Drawing.Size(800, 190)
+  $blv.Size = New-Object Drawing.Size($ctlW, 190)
   $blv.Anchor = 'Top,Left,Right'
   $blv.BorderStyle = 'FixedSingle'
-  $blv.BackColor = [Drawing.Color]::White
+  $blv.BackColor = $card
   foreach ($c in @(@('Part', 76), @('Device', 220), @('Provider', 140), @('Version', 110), @('Date', 70), @('Note', 150))) {
     [void]$blv.Columns.Add($c[0], $c[1])
   }
   $tab3.Controls.Add($blv)
 
   $btext = New-Object Windows.Forms.TextBox
-  $btext.Multiline = $true; $btext.ReadOnly = $true; $btext.ScrollBars = 'Vertical'
-  $btext.BackColor = 'Window'
+  $btext.Multiline = $true; $btext.ReadOnly = $true; $btext.ScrollBars = 'None'
+  $btext.BackColor = $card
   $btext.Font = New-Object Drawing.Font('Consolas', 9)
   $btext.Location = New-Object Drawing.Point(12, 212)
-  $btext.Size = New-Object Drawing.Size(800, 240)
+  $btext.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 222))
   $btext.Anchor = 'Top,Left,Right,Bottom'
   $btext.BorderStyle = 'FixedSingle'
   $tab3.Controls.Add($btext)
 
   $btnBoard = New-Object Windows.Forms.Button
   $btnBoard.Text = 'Open support page'
-  $btnBoard.Location = New-Object Drawing.Point(12, 462)
+  $btnBoard.Location = New-Object Drawing.Point(12, $btnRowY)
   $btnBoard.Size = New-Object Drawing.Size(160, 30)
   $btnBoard.Anchor = 'Bottom,Left'
   & $flat $btnBoard $false
@@ -1610,6 +1963,7 @@ function Show-Gui {
       [void]$it.SubItems.Add($d.Note)
       [void]$blv.Items.Add($it)
     }
+    if ($fitList) { & $fitList $blv $btextCard 0.5 }
     $btext.Text = ((Get-BiosNotes (Get-BoardInfo)) -join "`r`n") + "`r`n`r`n" +
       'Drivers: Windows Update carries chipset, network and audio drivers, but the vendor page is usually newer. Graphics drivers come from NVIDIA or AMD directly.'
   }
@@ -1622,28 +1976,28 @@ function Show-Gui {
   $nlv = New-Object Windows.Forms.ListView
   $nlv.View = 'Details'; $nlv.CheckBoxes = $true; $nlv.FullRowSelect = $true; $nlv.HideSelection = $false
   $nlv.Location = New-Object Drawing.Point(12, 12)
-  $nlv.Size = New-Object Drawing.Size(800, 190)
+  $nlv.Size = New-Object Drawing.Size($ctlW, 190)
   $nlv.Anchor = 'Top,Left,Right'
   $nlv.BorderStyle = 'FixedSingle'
-  $nlv.BackColor = [Drawing.Color]::White
+  $nlv.BackColor = $card
   foreach ($c in @(@('Adapter', 120), @('Setting', 260), @('Now', 110), @('Change to', 100), @('Group', 170))) {
     [void]$nlv.Columns.Add($c[0], $c[1])
   }
   $tab4.Controls.Add($nlv)
 
   $ntext = New-Object Windows.Forms.TextBox
-  $ntext.Multiline = $true; $ntext.ReadOnly = $true; $ntext.ScrollBars = 'Vertical'
-  $ntext.BackColor = 'Window'
+  $ntext.Multiline = $true; $ntext.ReadOnly = $true; $ntext.ScrollBars = 'None'
+  $ntext.BackColor = $card
   $ntext.Font = New-Object Drawing.Font('Consolas', 9)
   $ntext.Location = New-Object Drawing.Point(12, 212)
-  $ntext.Size = New-Object Drawing.Size(800, 240)
+  $ntext.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 222))
   $ntext.Anchor = 'Top,Left,Right,Bottom'
   $ntext.BorderStyle = 'FixedSingle'
   $tab4.Controls.Add($ntext)
 
   $btnNet = New-Object Windows.Forms.Button
   $btnNet.Text = 'Apply selected'
-  $btnNet.Location = New-Object Drawing.Point(12, 462)
+  $btnNet.Location = New-Object Drawing.Point(12, $btnRowY)
   $btnNet.Size = New-Object Drawing.Size(130, 30)
   $btnNet.Anchor = 'Bottom,Left'
   & $flat $btnNet $true
@@ -1663,9 +2017,14 @@ function Show-Gui {
     }
     # an empty grid is just dead space - drop it and let the report fill the pane
     $nlv.Visible = ($nlv.Items.Count -gt 0)
+    if ($bars -and $bars[$nlv]) { $bars[$nlv].Visible = $nlv.Visible }
     $btnNet.Visible = ($nlv.Items.Count -gt 0)
-    $ntextCard.Top = $(if ($nlv.Visible) { 212 } else { 12 })
-    $ntextCard.Height = $(if ($nlv.Visible) { 240 } else { 440 })
+    if ($nlv.Visible) {
+      & $fitList $nlv $ntextCard 0.4
+    } else {
+      $ntextCard.Top = & $sc 12
+      $ntextCard.Height = $tab4.ClientSize.Height - (& $sc 64)
+    }
 
     $head = if ($nlv.Items.Count -eq 0) {
       'Nothing to change - every power saving and latency setting this tool checks is already off.'
@@ -1681,19 +2040,21 @@ function Show-Gui {
   }
 
   $nlv.Add_ItemSelectionChanged({
-    if ($nlv.SelectedItems.Count -gt 0) { $ntext.Text = $nlv.SelectedItems[0].Tag.Why + "`r`n`r`n" + $ntext.Text.Substring($ntext.Text.IndexOf("`r`n`r`n") + 4) }
+    if ($nlv.SelectedItems.Count -gt 0) {
+      $break = $ntext.Text.IndexOf("`r`n`r`n")
+      $rest = $(if ($break -ge 0) { $ntext.Text.Substring($break + 4) } else { $ntext.Text })
+      $ntext.Text = $nlv.SelectedItems[0].Tag.Why + "`r`n`r`n" + $rest
+    }
   })
 
   $btnNet.Add_Click({
     $items = @($nlv.CheckedItems)
     if ($items.Count -eq 0) {
-      [void][Windows.Forms.MessageBox]::Show('Tick at least one row first.', 'TsakasOptimizer')
+      [void](& $dialog 'Tick at least one row first.' 'TsakasOptimizer' 'OK')
       return
     }
     $names = ($items | ForEach-Object { "{0}: {1}" -f $_.Tag.Adapter, $_.Tag.Setting }) -join "`r`n"
-    $ans = [Windows.Forms.MessageBox]::Show(
-      "Apply these $($items.Count) change(s)?`r`n`r`n$names`r`n`r`nThe adapter resets, so the connection drops for a second or two.",
-      'TsakasOptimizer', 'YesNo', 'Question')
+    $ans = & $dialog "Apply these $($items.Count) change(s)?`r`n`r`n$names`r`n`r`nThe adapter resets, so the connection drops for a second or two." 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
     $done = 0; $errs = @()
     foreach ($it in $items) {
@@ -1709,7 +2070,7 @@ function Show-Gui {
   $alv = New-Object Windows.Forms.ListView
   $alv.View = 'Details'; $alv.CheckBoxes = $true; $alv.FullRowSelect = $true; $alv.HideSelection = $false
   $alv.Location = New-Object Drawing.Point(12, 12)
-  $alv.Size = New-Object Drawing.Size(800, 260)
+  $alv.Size = New-Object Drawing.Size($ctlW, 260)
   $alv.Anchor = 'Top,Left,Right'
   foreach ($c in @(@('App', 100), @('Action', 100), @('Current state', 180), @('Result', 120), @('What it does', 300))) {
     [void]$alv.Columns.Add($c[0], $c[1])
@@ -1717,16 +2078,16 @@ function Show-Gui {
   $tab5.Controls.Add($alv)
 
   $atext = New-Object Windows.Forms.TextBox
-  $atext.Multiline = $true; $atext.ReadOnly = $true; $atext.ScrollBars = 'Vertical'
+  $atext.Multiline = $true; $atext.ReadOnly = $true; $atext.ScrollBars = 'None'
   $atext.Location = New-Object Drawing.Point(12, 282)
-  $atext.Size = New-Object Drawing.Size(800, 170)
+  $atext.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 292))
   $atext.Anchor = 'Top,Left,Right,Bottom'
   $atext.Text = 'Select a row to see why it is listed.'
   $tab5.Controls.Add($atext)
 
   $btnApps = New-Object Windows.Forms.Button
   $btnApps.Text = 'Apply selected'
-  $btnApps.Location = New-Object Drawing.Point(12, 462)
+  $btnApps.Location = New-Object Drawing.Point(12, $btnRowY)
   $btnApps.Size = New-Object Drawing.Size(130, 30)
   $btnApps.Anchor = 'Bottom,Left'
   & $flat $btnApps $true
@@ -1743,6 +2104,7 @@ function Show-Gui {
       $it.Tag = $r
       [void]$alv.Items.Add($it)
     }
+    if ($fitList) { & $fitList $alv $atextCard 0.45 }
     if ($alv.Items.Count -eq 0) {
       $atext.Text = 'Discord and Spotify have no startup, running-process, or rebuildable-cache actions to offer right now.'
     } else {
@@ -1760,12 +2122,11 @@ function Show-Gui {
   $btnApps.Add_Click({
     $items = @($alv.CheckedItems)
     if ($items.Count -eq 0) {
-      [void][Windows.Forms.MessageBox]::Show('Tick at least one row first.', 'TsakasOptimizer')
+      [void](& $dialog 'Tick at least one row first.' 'TsakasOptimizer' 'OK')
       return
     }
     $names = ($items | ForEach-Object { "$($_.Tag.App): $($_.Tag.Action)" }) -join "`r`n"
-    $ans = [Windows.Forms.MessageBox]::Show(
-      "Apply these changes?`r`n`r`n$names", 'TsakasOptimizer', 'YesNo', 'Question')
+    $ans = & $dialog "Apply these changes?`r`n`r`n$names" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
     $done = 0; $errs = @()
     foreach ($it in $items) {
@@ -1780,25 +2141,27 @@ function Show-Gui {
 
   # ---- every list and text pane becomes a rounded white card ----
   $rowHeight = New-Object Windows.Forms.ImageList
-  $rowHeight.ImageSize = New-Object Drawing.Size(1, 28)
+  $rowHeight.ImageSize = New-Object Drawing.Size(1, (& $sc 28))
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
     $l.SmallImageList = $rowHeight
     $l.BorderStyle = 'None'
     $l.HeaderStyle = 'Nonclickable'
     $l.Font = New-Object Drawing.Font($family, 10)
+    $l.BackColor = $card
+    $l.ForeColor = $ink
   }
   # the reports are prose, so a proportional face reads far better than Consolas
   foreach ($t in @($details, $mtext, $btext, $ntext, $atext)) {
-    $t.BackColor = $white
+    $t.BackColor = $card
     $t.ForeColor = $ink
     $t.Font = New-Object Drawing.Font($family, 10)
   }
   $details.ForeColor = $muted
-  $detailsCard = Add-PaddedCard $details 10 $line 8
-  $mtextCard   = Add-PaddedCard $mtext   10 $line 14
-  $btextCard   = Add-PaddedCard $btext   10 $line 14
-  $ntextCard   = Add-PaddedCard $ntext   10 $line 14
-  $atextCard   = Add-PaddedCard $atext   10 $line 14
+  $detailsCard = Add-PaddedCard $details 10 $line 8 $card
+  $mtextCard   = Add-PaddedCard $mtext   10 $line 14 $card
+  $btextCard   = Add-PaddedCard $btext   10 $line 14 $card
+  $ntextCard   = Add-PaddedCard $ntext   10 $line 14 $card
+  $atextCard   = Add-PaddedCard $atext   10 $line 14 $card
   foreach ($c in @($lv, $mlv, $blv, $nlv, $alv)) {
     Set-Rounded $c 10
     Add-Hairline $c $line 10
@@ -1808,28 +2171,60 @@ function Show-Gui {
   $drawHeader = {
     param($s, $e)
     $g = $e.Graphics
-    $b = New-Object Drawing.SolidBrush($white)
+    $b = New-Object Drawing.SolidBrush($card)
     $g.FillRectangle($b, $e.Bounds); $b.Dispose()
     $pen = New-Object Drawing.Pen($line, 1)
     $g.DrawLine($pen, $e.Bounds.Left, ($e.Bounds.Bottom - 1), $e.Bounds.Right, ($e.Bounds.Bottom - 1)); $pen.Dispose()
-    $r = New-Object Drawing.Rectangle(($e.Bounds.X + 8), $e.Bounds.Y, [Math]::Max(0, $e.Bounds.Width - 12), $e.Bounds.Height)
+    $r = New-Object Drawing.Rectangle(($e.Bounds.X + (& $sc 8)), $e.Bounds.Y, [Math]::Max(0, $e.Bounds.Width - (& $sc 12)), $e.Bounds.Height)
     [Windows.Forms.TextRenderer]::DrawText($g, $e.Header.Text, $headerFont, $r, $muted,
       [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, EndEllipsis')
   }.GetNewClosure()
-  # The last column takes whatever width is left. Space for the vertical scrollbar
-  # is always kept free, because rows load after this runs and the scrollbar
-  # would otherwise push the list into a horizontal scroll.
+  # the native checkbox stays white on a dark row; a state image list replaces
+  # both glyphs, which is the only hook WinForms gives for them
+  $checkImages = New-Object Windows.Forms.ImageList
+  $cbSize = & $sc 16
+  $checkImages.ImageSize = New-Object Drawing.Size($cbSize, $cbSize)
+  $checkImages.ColorDepth = 'Depth32Bit'
+  foreach ($on in @($false, $true)) {
+    $bmp = New-Object Drawing.Bitmap($cbSize, $cbSize)
+    $g = [Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = 'AntiAlias'
+    $g.ScaleTransform($dpiScale, $dpiScale)
+    if ($on) {
+      $b = New-Object Drawing.SolidBrush($accentFill)
+      $g.FillRectangle($b, 2, 2, 12, 12)
+      $b.Dispose()
+      $pen = New-Object Drawing.Pen($white, 1.7)
+      $g.DrawLines($pen, @(
+        (New-Object Drawing.PointF(4.5, 8.2)),
+        (New-Object Drawing.PointF(7, 10.6)),
+        (New-Object Drawing.PointF(11.5, 5.4))))
+      $pen.Dispose()
+    } else {
+      $pen = New-Object Drawing.Pen($muted, 1)
+      $g.DrawRectangle($pen, 2, 2, 11, 11)
+      $pen.Dispose()
+    }
+    $g.Dispose()
+    $checkImages.Images.Add($bmp)
+  }
+
+  # the last column takes whatever width is left
   $fillLast = {
     param($s, $e)
     $n = $s.Columns.Count
     if ($n -eq 0) { return }
     $used = 0
     for ($i = 0; $i -lt $n - 1; $i++) { $used += $s.Columns[$i].Width }
-    $room = $s.Width - $used - [Windows.Forms.SystemInformation]::VerticalScrollBarWidth - 2
+    # exactly to the edge: any gap is header the owner-draw never reaches, and
+    # the system paints that strip white
+    $room = $s.ClientSize.Width - $used
     $s.Columns[$n - 1].Width = [Math]::Max(60, $room)
   }
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
+    foreach ($col in $l.Columns) { $col.Width = & $sc $col.Width }
     $l.OwnerDraw = $true
+    if ($l.CheckBoxes) { $l.StateImageList = $checkImages }
     $l.Add_DrawColumnHeader($drawHeader)
     $l.Add_DrawItem({ param($s, $e) $e.DrawDefault = $true })
     $l.Add_DrawSubItem({ param($s, $e) $e.DrawDefault = $true })
@@ -1850,27 +2245,84 @@ public static class TsakasNative {
   public static extern int SetWindowTheme(IntPtr hWnd, string appName, string idList);
   [DllImport("dwmapi.dll")]
   public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+  // undocumented, but the only way to get dark checkboxes and scrollbars in Win32 controls
+  [DllImport("uxtheme.dll", EntryPoint = "#135", CharSet = CharSet.Unicode)]
+  public static extern int SetPreferredAppMode(int mode);
+  [DllImport("uxtheme.dll", EntryPoint = "#104")]
+  public static extern void RefreshImmersiveColorPolicyState();
+  [DllImport("user32.dll", CharSet = CharSet.Auto)]
+  public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")]
+  public static extern bool ShowScrollBar(IntPtr hWnd, int bar, bool show);
 }
 '@
     }
-    foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { [void][TsakasNative]::SetWindowTheme($l.Handle, 'Explorer', $null) }
+    # 2 = force dark; this is what actually darkens checkboxes and scrollbars
+    try { [void][TsakasNative]::SetPreferredAppMode(2); [TsakasNative]::RefreshImmersiveColorPolicyState() } catch { }
+    foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
+      [void][TsakasNative]::SetWindowTheme($l.Handle, 'DarkMode_Explorer', $null)
+      # the header is its own window, and keeps a light background unless themed too
+      $hdr = [TsakasNative]::SendMessage($l.Handle, 0x101F, [IntPtr]::Zero, [IntPtr]::Zero)   # LVM_GETHEADER
+      if ($hdr -ne [IntPtr]::Zero) { [void][TsakasNative]::SetWindowTheme($hdr, 'DarkMode_ItemsView', $null) }
+    }
     $colorRef = { param($c) [int]$c.R -bor ([int]$c.G -shl 8) -bor ([int]$c.B -shl 16) }
     $caption = & $colorRef $panel
     $captionText = & $colorRef $ink
     $round = 2
-    # 35 caption colour, 36 caption text, 33 corner preference - Windows 11 only, ignored elsewhere
+    $dark = 1
+    # 20 dark title bar (so the window buttons invert), 35 caption colour,
+    # 36 caption text, 33 corner preference - Windows 11 only, ignored elsewhere
+    [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 20, [ref]$dark, 4)
     [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 35, [ref]$caption, 4)
     [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 36, [ref]$captionText, 4)
     [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 33, [ref]$round, 4)
   } catch { }
 
+  # slim scrollbars for every list and report pane
+  $barTrack = $card
+  $barThumb = [Drawing.Color]::FromArgb(125, 125, 133)
+  $barHot   = [Drawing.Color]::FromArgb(168, 168, 178)
+  # A list sized to its rows needs no scrollbar at all. It only grows to a share
+  # of the page, so a long list still scrolls rather than pushing the report out.
+  $fitList = {
+    param($list, $report, $maxShare)
+    $rowH = $(if ($list.Items.Count -gt 0) { $list.Items[0].Bounds.Height } else { 0 })
+    if ($rowH -le 0) { $rowH = $list.Font.Height + 8 }
+    $needed = (& $sc 40) + ($list.Items.Count * $rowH)
+    $ceiling = [int]($list.Parent.ClientSize.Height * $maxShare)
+    $list.Height = [Math]::Max((& $sc 90), [Math]::Min($needed, $ceiling))
+    if ($bars -and $bars[$list]) { $bars[$list].Height = $list.Height - (& $sc 4) }
+    if ($report) {
+      $report.Top = $list.Bottom + (& $sc 22)
+      $report.Height = [Math]::Max((& $sc 90), ($list.Parent.ClientSize.Height - (& $sc 52) - $report.Top))
+    }
+  }
+
+  $bars = @{}
+  foreach ($c in @($lv, $mlv, $blv, $nlv, $alv, $mtext, $btext, $ntext, $atext)) {
+    $bars[$c] = Add-SlimScrollbar $c $barTrack $barThumb $barHot $dpiScale
+  }
+  & $fitList $mlv $mtextCard 0.4        # memory loaded before the bars existed
+  $barSyncs = @($bars.Values | ForEach-Object { $_.Sync })
+  foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { & $fillLast $l $null }
+  $barTimer = New-Object Windows.Forms.Timer
+  $barTimer.Interval = 120
+  $barTimer.Add_Tick({ foreach ($sync in $barSyncs) { & $sync } }.GetNewClosure())
+  $barTimer.Start()
+  $form.Add_Deactivate({ $barTimer.Stop() }.GetNewClosure())
+  $form.Add_Activated({ $barTimer.Start() }.GetNewClosure())
+
+  # everything above is laid out at 100%; this is where it becomes real pixels
+  if ($dpiScale -ne 1) { $form.Scale((New-Object Drawing.SizeF($dpiScale, $dpiScale))) }
+  foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { & $fillLast $l $null }
+
   & $selectSection 0
 
   # bottom-right of the tab page, once the real sizes exist
   $form.Add_Shown({
-    $btnElev.Left = $tab1.ClientSize.Width - $btnElev.Width - 12
+    $btnElev.Left = $tab1.ClientSize.Width - $btnElev.Width - (& $sc 12)
     $btnElev.Top  = $btnApply.Top
-  })
+  }.GetNewClosure())
 
   [void]$form.ShowDialog()
 }
@@ -1908,8 +2360,8 @@ function Invoke-SelfTest {
     @{N = 'EXPO off is detected';                 R = ((Get-MemoryNotes $noExpo 4 $cpu) -join "`n") -match 'EXPO/XMP is OFF'}
     @{N = 'EXPO on is not flagged';               R = -not (((Get-MemoryNotes $good 4 $cpu) -join "`n") -match 'is OFF')}
     @{N = 'correct A2/B2 placement passes';       R = ((Get-MemoryNotes $good 4 $cpu) -join "`n") -match 'correct placement'}
-    @{N = 'sticks in A1/B1 are flagged';          R = ((Get-MemoryNotes $slot13 4 $cpu) -join "`n") -match 'FIRST slot'}
-    @{N = 'both sticks one channel is flagged';   R = ((Get-MemoryNotes $oneCh 4 $cpu) -join "`n") -match 'same channel'}
+    @{N = 'sticks in A1/B1 are flagged';          R = ((Get-MemoryNotes $slot13 4 $cpu) -join "`n") -match 'in A1/B1'}
+    @{N = 'both sticks one channel is flagged';   R = ((Get-MemoryNotes $oneCh 4 $cpu) -join "`n") -match 'single channel, half'}
     @{N = 'AM5 target advice appears';            R = ((Get-MemoryNotes $good 4 $cpu) -join "`n") -match 'DDR5-6000 CL30'}
     # behaviour scoring
     @{N = 'background autostart is flagged';      R = ((Get-ProcessGuess ([pscustomobject]@{Name='Overwolf';HasWindow=$false;RamMB=190;Company='Overwolf LTD';AutoStart=$true;BootMinutes=0.3})).Score -ge 5)}
@@ -1943,11 +2395,48 @@ function Invoke-SelfTest {
     @{N = 'network scan runs without error';      R = ((@(Get-NetFindings)).Count -ge 0)}
     # motherboard tab
     @{N = 'a 2 year old BIOS is flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-24);AgeMonths=24;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'over 18 months old'}
-    @{N = 'a recent BIOS is not flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'BIOS is recent'}
+    @{N = 'a recent BIOS is not flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'Recent BIOS'}
     @{N = 'AM5 gets the AGESA note';              R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'AGESA'}
-    @{N = 'generic Microsoft driver is called out'; R = ((Get-DriverNote 'Microsoft' (Get-Date)) -match 'generic Windows driver')}
-    @{N = 'an old driver is called out';          R = ((Get-DriverNote 'Realtek' ((Get-Date).AddYears(-4))) -match 'over 3 years old')}
-    @{N = 'a current vendor driver is silent';    R = ((Get-DriverNote 'Realtek' (Get-Date)) -eq '')}
+    @{N = 'generic Microsoft driver is called out'; R = ((Get-DriverNote 'Microsoft' (Get-Date) 'oem42.inf' 'PCI\VEN_8086') -match 'generic Windows driver')}
+    @{N = 'an old driver is called out';          R = ((Get-DriverNote 'Realtek' ((Get-Date).AddYears(-4)) 'oem11.inf' '') -match 'over 3 years old')}
+    @{N = 'a current vendor driver is silent';    R = ((Get-DriverNote 'Realtek' (Get-Date) 'oem11.inf' '') -eq '')}
+    @{N = 'USB audio class driver is not nagged'; R = (((Get-DriverNote 'Microsoft' (Get-Date) 'usbaudio2.inf' 'USB\VID_1532&PID_0543') -notmatch 'vendor one usually') -and ((Get-DriverNote 'Microsoft' (Get-Date) 'usbaudio2.inf' 'USB\VID_1532') -match 'standard one'))}
+    @{N = 'NVIDIA HDMI audio names NVIDIA';      R = ((Get-DriverNote 'Microsoft' (Get-Date) 'hdaudio.inf' 'HDAUDIO\FUNC_01&VEN_10DE&DEV_00A4') -match 'NVIDIA ships one')}
+    @{N = 'AMD HDMI audio names AMD';            R = ((Get-DriverNote 'Microsoft' (Get-Date) 'hdaudio.inf' 'HDAUDIO\FUNC_01&VEN_1002&DEV_AAF0') -match 'AMD ships one')}
+    @{N = 'the 2006 inbox date is not aged';     R = ((Get-DriverNote 'Microsoft' (Get-Date '2006-06-21') 'prnms009.inf' '') -notmatch 'years old')}
+    @{N = 'a genuinely old driver still ages';   R = ((Get-DriverNote 'Realtek' (Get-Date '2006-06-20') 'oem11.inf' '') -match 'over 3 years old')}
+    # the undo log: PowerShell 5.1 returns a JSON array as one object, which used
+    # to nest the log on every save and leave undo seeing a single entry
+    @{N = 'undo log keeps every entry';          R = (& {
+        $f = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
+        try {
+          Add-UndoEntry ([pscustomobject]@{ Type = 'Service'; Name = 'A'; Previous = 'Auto' }) $f
+          Add-UndoEntry ([pscustomobject]@{ Type = 'Service'; Name = 'B'; Previous = 'Auto' }) $f
+          Add-UndoEntry ([pscustomobject]@{ Type = 'Service'; Name = 'C'; Previous = 'Auto' }) $f
+          $read = Read-UndoLog $f
+          (@($read).Count -eq 3) -and (@($read)[0].Name -eq 'A') -and (@($read)[2].Name -eq 'C')
+        } finally { Remove-Item $f -ErrorAction SilentlyContinue }
+      })}
+    @{N = 'a log nested by old builds is read'; R = (& {
+        $f = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
+        try {
+          '[{"value":[{"Type":"Service","Name":"A","Previous":"Auto"},{"Type":"Service","Name":"B","Previous":"Auto"}],"Count":2},{"Type":"Service","Name":"C","Previous":"Auto"}]' | Out-File $f -Encoding utf8
+          @(Read-UndoLog $f).Count -eq 3
+        } finally { Remove-Item $f -ErrorAction SilentlyContinue }
+      })}
+    @{N = 'a single-entry log still reads';      R = (& {
+        $f = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
+        try {
+          '{"Type":"Service","Name":"Spooler","Previous":"Auto"}' | Out-File $f -Encoding utf8
+          @(Read-UndoLog $f).Count -eq 1
+        } finally { Remove-Item $f -ErrorAction SilentlyContinue }
+      })}
+    @{N = 'AM5 desktop chip is detected';        R = ((Test-Am5 'AMD Ryzen 7 7800X3D 8-Core Processor') -and (Test-Am5 'AMD Ryzen 5 8600G w/ Radeon Graphics') -and (Test-Am5 'AMD Ryzen 9 9950X 16-Core'))}
+    @{N = 'mobile Ryzen is not called AM5';      R = (-not (Test-Am5 'AMD Ryzen 7 7735HS with Radeon') -and -not (Test-Am5 'AMD Ryzen 9 7945HX'))}
+    @{N = 'AM4 and Intel are not called AM5';    R = (-not (Test-Am5 'AMD Ryzen 5 5600X 6-Core') -and -not (Test-Am5 'Intel Core i9-14900K'))}
+    @{N = 'part number gives the rated speed';   R = ((Get-PartSpeed 'F5-6000J3038F16G') -eq 6000 -and (Get-PartSpeed 'CMK32GX5M2B6000C36') -eq 6000 -and (Get-PartSpeed 'KHX3200C16D4/8G') -eq 3200)}
+    @{N = 'no rated speed when absent';          R = ((Get-PartSpeed 'NO-SUCH-PART') -eq 0)}
+    @{N = 'chipset package reads or is absent';   R = ($null -eq (Get-ChipsetPackage) -or $null -ne (Get-ChipsetPackage).Version)}
     @{N = 'board info reads without error';       R = ((Get-BoardInfo) -ne $null)}
     @{N = 'G.Skill part number gives CL30-38';    R = (((Get-PartTimings 'F5-6000J3038F16G').CL -eq 30) -and ((Get-PartTimings 'F5-6000J3038F16G').tRCD -eq 38))}
     @{N = 'Corsair part number gives CL36';       R = ((Get-PartTimings 'CMK32GX5M2B6000C36').CL -eq 36)}
