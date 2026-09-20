@@ -2,7 +2,6 @@
 <#
   TsakasOptimizer.ps1 - scans running processes + auto-start services, flags the ones
   commonly safe to close or switch to Manual, and asks before touching anything.
-  Service changes are logged so -Undo can put them back.
   #>
 [CmdletBinding()]
 param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
@@ -25,7 +24,7 @@ if (-not ($Console -or $Report -or $Undo -or $SelfTest)) {
   } catch { }
 }
 
-$Version = '1.8.1'
+$Version = '1.12.0'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -451,6 +450,14 @@ function Invoke-Undo {
         'NetProperty' {
           Set-NetAdapterAdvancedProperty -Name $e.Adapter -DisplayName $e.Name -DisplayValue $e.Previous -ErrorAction Stop
         }
+        'RegValue' {
+          if ($e.Existed) {
+            if (-not (Test-Path $e.Path)) { [void](New-Item -Path $e.Path -Force) }
+            New-ItemProperty -Path $e.Path -Name $e.Name -Value $e.Previous -PropertyType $e.Kind -Force | Out-Null
+          } else {
+            Remove-ItemProperty -Path $e.Path -Name $e.Name -ErrorAction SilentlyContinue
+          }
+        }
         'TcpipReg' {
           New-ItemProperty -Path $TcpipKey -Name $e.Name -Value ([int]$e.Previous) -PropertyType DWord -Force | Out-Null
         }
@@ -473,20 +480,46 @@ function Invoke-Undo {
 }
 
 # --- scan --------------------------------------------------------------------
-function Get-Findings {
+# -All keeps the rows the scan would otherwise drop, marked as nothing to do, so
+# the tab can show the whole machine instead of only what it wants to change.
+function Get-Findings([switch]$All) {
   $found = New-Object System.Collections.ArrayList
   $autoNames = Get-AutoStartNames
   $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime
+  $procs = @(Get-Process)
+  $byId = @{}
+  foreach ($p in $procs) { $byId[[int]$p.Id] = $p }
 
-  foreach ($g in (Get-Process | Group-Object ProcessName)) {
-    if (Test-Match $g.Name $Protected) { continue }
+  # Automatic still starts with Windows, Manual only starts on demand, Disabled
+  # never starts. One step down is what ticking a service row does.
+  $stepDown = { param($mode) switch ("$mode") { 'Auto' { 'Manual' } 'Manual' { 'Disabled' } default { '' } } }
+
+  $leave = {
+    param($type, $name, $label, $ram, $count, $why, $extra, $mode, $system = $false)
+    [void]$found.Add([pscustomobject]@{
+      Type = $type; Name = $name; Label = $label; RamMB = $ram; Count = $count
+      Why = $why; Action = $(if ($type -eq 'Process') { 'Kill' } else { 'Service' })
+      Target = $(if ($type -eq 'Process') { '' } else { & $stepDown $mode })
+      Extra = $extra; Confidence = 'Leave'; Mode = $mode; System = $system })
+  }
+
+  foreach ($g in ($procs | Group-Object ProcessName)) {
     $ram = [math]::Round((($g.Group | Measure-Object WorkingSet64 -Sum).Sum) / 1MB, 1)
+    if (Test-Match $g.Name $Protected) {
+      if ($All) {
+        [void]$found.Add([pscustomobject]@{
+          Type = 'Process'; Name = $g.Name; Label = $g.Name; RamMB = $ram; Count = $g.Count
+          Why = 'Windows itself, or something the security stack needs. The tool would never pick this - closing it can crash Windows or sign you out.'
+          Action = 'Kill'; Target = ''; Extra = ''; Confidence = 'Leave'; Mode = ''; System = $true })
+      }
+      continue
+    }
     $s = Get-Suggestion $g.Name $null
 
     if ($s) {
       [void]$found.Add([pscustomobject]@{
         Type = 'Process'; Name = $g.Name; Label = $g.Name; RamMB = $ram; Count = $g.Count
-        Why = $s.W; Action = 'Kill'; Extra = ''; Confidence = 'Known'
+        Why = $s.W; Action = 'Kill'; Target = ''; Extra = ''; Confidence = 'Known'; Mode = ''; System = $false
       })
       continue
     }
@@ -494,8 +527,14 @@ function Get-Findings {
     # not in the catalog - score it
     $first = $g.Group[0]
     $path = try { $first.Path } catch { '' }
-    if (-not $path) { continue }                       # cannot inspect it, so do not guess
-    if ($path -like "$env:SystemRoot\*") { continue }  # part of Windows
+    if (-not $path) {
+      if ($All) { & $leave 'Process' $g.Name $g.Name $ram $g.Count 'Windows will not say where this one runs from, so it is left alone.' '' '' }
+      continue
+    }
+    if ($path -like "$env:SystemRoot\*") {
+      if ($All) { & $leave 'Process' $g.Name $g.Name $ram $g.Count 'Runs from the Windows folder, so it is part of Windows.' '' '' }
+      continue
+    }
     $started = try { $first.StartTime } catch { $null }
     $company = try { $first.Company } catch { '' }
     $info = [pscustomobject]@{
@@ -507,28 +546,44 @@ function Get-Findings {
       BootMinutes = $(if ($started -and $boot) { ($started - $boot).TotalMinutes } else { $null })
     }
     $guess = Get-ProcessGuess $info
-    if ($guess.Score -lt 5) { continue }
+    if ($guess.Score -lt 5) {
+      if ($All) {
+        $why = $(if ($guess.Reasons.Count) { 'Nothing worth flagging: ' + ($guess.Reasons -join '; ') + '.' }
+                 else { 'Left alone on purpose - this is the kind of program the guesswork stays away from.' })
+        & $leave 'Process' $g.Name $g.Name $ram $g.Count $why '' ''
+      }
+      continue
+    }
     [void]$found.Add([pscustomobject]@{
       Type = 'Process'; Name = $g.Name; Label = $g.Name; RamMB = $ram; Count = $g.Count
       Why = ("Flagged because: " + ($guess.Reasons -join '; ') + ".")
-      Action = 'Kill'; Extra = ''; Confidence = 'Guess'
+      Action = 'Kill'; Target = ''; Extra = ''; Confidence = 'Guess'; Mode = ''; System = $false
     })
   }
 
   foreach ($svc in (Get-CimInstance Win32_Service -ErrorAction SilentlyContinue)) {
-    if ($svc.StartMode -ne 'Auto') { continue }
-    if (Test-Match $svc.Name $ProtectedServices) { continue }
     $ram = 0
-    if ($svc.ProcessId -gt 0) {
-      $p = Get-Process -Id $svc.ProcessId -ErrorAction SilentlyContinue
-      if ($p) { $ram = [math]::Round($p.WorkingSet64 / 1MB, 1) }
+    if ($svc.ProcessId -gt 0 -and $byId.ContainsKey([int]$svc.ProcessId)) {
+      $ram = [math]::Round($byId[[int]$svc.ProcessId].WorkingSet64 / 1MB, 1)
+    }
+    if ($svc.StartMode -ne 'Auto') {
+      if ($All) {
+        $why = $(if ($svc.StartMode -eq 'Disabled') { 'Already disabled: it cannot start at all.' }
+                 else { 'Starts only when something asks for it, not with Windows.' })
+        & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 $why $svc.State $svc.StartMode (Test-Match $svc.Name $ProtectedServices)
+      }
+      continue
+    }
+    if (Test-Match $svc.Name $ProtectedServices) {
+      if ($All) { & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 'Windows needs this one. The tool would never pick it - changing it can break logging in, networking or sound.' $svc.State $svc.StartMode $true }
+      continue
     }
     $s = Get-Suggestion $svc.Name $svc.DisplayName
 
     if ($s) {
       [void]$found.Add([pscustomobject]@{
         Type = 'Service'; Name = $svc.Name; Label = $svc.DisplayName; RamMB = $ram; Count = 1
-        Why = $s.W; Action = 'Manual'; Extra = $svc.State; Confidence = 'Known'
+        Why = $s.W; Action = 'Service'; Target = 'Manual'; Extra = $svc.State; Confidence = 'Known'; Mode = $svc.StartMode; System = $false
       })
       continue
     }
@@ -536,15 +591,23 @@ function Get-Findings {
     $exe = $svc.PathName -replace '^"([^"]+)".*', '$1' -replace '^(\S+\.exe).*', '$1'
     $guess = Get-ServiceGuess ([pscustomobject]@{
       Name = $svc.Name; DisplayName = $svc.DisplayName; PathName = $exe; State = $svc.State })
-    if ($guess.Score -lt 4) { continue }
+    if ($guess.Score -lt 4) {
+      if ($All) {
+        $why = $(if ($exe -like "$env:SystemRoot\*") { 'A Windows service set to start with Windows. Left alone.' }
+                 else { 'Starts with Windows, but nothing about it looks like an updater or a helper.' })
+        & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 $why $svc.State $svc.StartMode
+      }
+      continue
+    }
     [void]$found.Add([pscustomobject]@{
       Type = 'Service'; Name = $svc.Name; Label = $svc.DisplayName; RamMB = $ram; Count = 1
-      Why = ("Flagged because: " + ($guess.Reasons -join '; ') + ". Manual is reversible - if something breaks, press Undo.")
-      Action = 'Manual'; Extra = $svc.State; Confidence = 'Guess'
+      Why = ("Flagged because: " + ($guess.Reasons -join '; ') + ". Manual is reversible: Windows still starts it when something asks for it.")
+      Action = 'Service'; Target = 'Manual'; Extra = $svc.State; Confidence = 'Guess'; Mode = $svc.StartMode; System = $false
     })
   }
 
-  $found | Sort-Object -Property @{E = { $_.Confidence -eq 'Guess' }}, @{E = 'RamMB'; D = $true}
+  # what to act on first, then what is merely listed
+  $found | Sort-Object -Property @{E = { $_.Confidence -eq 'Leave' }}, @{E = { $_.Confidence -eq 'Guess' }}, @{E = 'RamMB'; D = $true}
 }
 
 # --- act ---------------------------------------------------------------------
@@ -554,6 +617,8 @@ function Invoke-Finding($f) {
     Write-Host ("      closed {0} (freed about {1} MB)" -f $f.Name, $f.RamMB) -ForegroundColor Green
     return $f.RamMB
   }
+  $target = $(if ($f.Target) { $f.Target } else { 'Manual' })
+  if ("$($f.Mode)" -eq 'Disabled') { throw 'already disabled, nothing left to turn off' }
   if (-not (Test-Admin)) {
     Write-Host '      needs Administrator - skipped.' -ForegroundColor Yellow
     return 0
@@ -562,9 +627,9 @@ function Invoke-Finding($f) {
   Add-UndoEntry ([pscustomobject]@{
     Type = 'Service'; Name = $f.Name; Previous = $svc.StartMode; When = (Get-Date).ToString('s')
   })
-  Set-Service -Name $f.Name -StartupType Manual -ErrorAction Stop
+  Set-Service -Name $f.Name -StartupType $target -ErrorAction Stop
   if ($svc.State -eq 'Running') { Stop-Service -Name $f.Name -Force -ErrorAction SilentlyContinue }
-  Write-Host ("      {0} set to Manual (undo with -Undo)" -f $f.Name) -ForegroundColor Green
+  Write-Host ("      {0} set to {1}" -f $f.Name, $target) -ForegroundColor Green
   return $f.RamMB
 }
 
@@ -1107,6 +1172,124 @@ function Invoke-AppAction($Row) {
   foreach ($dir in $Row.Data) { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+# --- windows settings --------------------------------------------------------
+# Each switch mirrors one toggle in the Settings app, and records what the value
+# was before it changed.
+function Get-RegValue([string]$Path, [string]$Name) {
+  return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+}
+
+function Set-RegValueLogged([string]$Path, [string]$Name, $Value, [string]$Kind) {
+  $old = Get-RegValue $Path $Name
+  Add-UndoEntry ([pscustomobject]@{
+    Type = 'RegValue'; Path = $Path; Name = $Name; Existed = ($null -ne $old)
+    Previous = $old; Kind = $Kind; When = (Get-Date).ToString('s') })
+  if (-not (Test-Path $Path)) { [void](New-Item -Path $Path -Force) }
+  New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Kind -Force | Out-Null
+}
+
+function Remove-RegValueLogged([string]$Path, [string]$Name, [string]$Kind) {
+  $old = Get-RegValue $Path $Name
+  if ($null -eq $old) { return }
+  Add-UndoEntry ([pscustomobject]@{
+    Type = 'RegValue'; Path = $Path; Name = $Name; Existed = $true
+    Previous = $old; Kind = $Kind; When = (Get-Date).ToString('s') })
+  Remove-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+}
+
+# animations keep running in open windows until Windows is told about the change
+function Update-AnimationSetting([bool]$On) {
+  if (-not ('TsakasNative' -as [type])) { return }
+  $SPI_SETCLIENTAREAANIMATION = 0x1043
+  $SPIF_SENDCHANGE = 2
+  [void][TsakasNative]::SystemParametersInfo($SPI_SETCLIENTAREAANIMATION, 0, [IntPtr]$(if ($On) { 1 } else { 0 }), $SPIF_SENDCHANGE)
+}
+
+$DoPolicyKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'
+$PersonalizeKey = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+$MetricsKey    = 'HKCU:\Control Panel\Desktop\WindowMetrics'
+$GameDvrKey    = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR'
+$GameStoreKey  = 'HKCU:\System\GameConfigStore'
+$GameBarKey    = 'HKCU:\SOFTWARE\Microsoft\GameBar'
+$CaptureKey    = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\graphicsCaptureProgrammatic'
+$CaptureNoBorderKey = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\graphicsCaptureWithoutBorder'
+
+function Get-WinSettings {
+  @(
+    [pscustomobject]@{
+      Title = 'Delivery Optimization'
+      Sub   = 'Uploads Windows updates to other PCs in the background. Off keeps updates coming from Microsoft only.'
+      Admin = $true
+      Read  = { $v = Get-RegValue $DoPolicyKey 'DODownloadMode'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on)
+        if ($on) { Remove-RegValueLogged $DoPolicyKey 'DODownloadMode' 'DWord' }
+        else     { Set-RegValueLogged $DoPolicyKey 'DODownloadMode' 0 'DWord' } }
+    }
+    [pscustomobject]@{
+      Title = 'Transparency effects'
+      Sub   = 'Blur behind Start, the taskbar and menus. Costs a little GPU time every frame.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $PersonalizeKey 'EnableTransparency'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on) Set-RegValueLogged $PersonalizeKey 'EnableTransparency' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Title = 'Animation effects'
+      Sub   = 'Window open, close and minimise animations. Off makes the desktop feel more immediate.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $MetricsKey 'MinAnimate'; return ($null -eq $v -or "$v" -ne '0') }
+      Write = { param($on)
+        Set-RegValueLogged $MetricsKey 'MinAnimate' $(if ($on) { '1' } else { '0' }) 'String'
+        Update-AnimationSetting $on }
+    }
+    [pscustomobject]@{
+      Title = 'Game Bar recording'
+      Sub   = 'Background recording so Game Bar can save the last few minutes. Off frees CPU and GPU while you play.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $GameDvrKey 'AppCaptureEnabled'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on)
+        Set-RegValueLogged $GameDvrKey 'AppCaptureEnabled' $(if ($on) { 1 } else { 0 }) 'DWord'
+        Set-RegValueLogged $GameStoreKey 'GameDVR_Enabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Title = 'Game Mode'
+      Sub   = 'Windows gives the running game priority and holds back background work. Worth leaving on.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $GameBarKey 'AutoGameModeEnabled'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on) Set-RegValueLogged $GameBarKey 'AutoGameModeEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Title = 'Screenshots and screen recording'
+      Sub   = 'Allow apps to take screenshots and record your screen. Desktop tools like OBS, ShareX and Snipping Tool are not affected.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $CaptureKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
+      Write = { param($on) Set-RegValueLogged $CaptureKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
+    }
+    [pscustomobject]@{
+      Title = 'Screenshot borders'
+      Sub   = 'Allow apps to take a screenshot of one window without its border.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $CaptureNoBorderKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
+      Write = { param($on) Set-RegValueLogged $CaptureNoBorderKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
+    }
+    [pscustomobject]@{
+      Title = 'Offline maps'
+      Sub   = 'Downloads and updates map data for the Maps app. Manual unless you actually use offline maps.'
+      Admin = $true
+      Read  = { $svc = Get-Service MapsBroker -ErrorAction SilentlyContinue
+                return ($null -ne $svc -and $svc.StartType -eq 'Automatic') }
+      Write = { param($on)
+        $svc = Get-Service MapsBroker -ErrorAction Stop
+        Add-UndoEntry ([pscustomobject]@{
+          Type = 'Service'; Name = 'MapsBroker'; Previous = "$($svc.StartType)"; When = (Get-Date).ToString('s') })
+        if ($on) { Set-Service -Name MapsBroker -StartupType Automatic -ErrorAction Stop }
+        else {
+          Set-Service -Name MapsBroker -StartupType Manual -ErrorAction Stop
+          Stop-Service -Name MapsBroker -Force -ErrorAction SilentlyContinue
+        } }
+    }
+  )
+}
+
 # --- small drawing helpers ---------------------------------------------------
 function New-RoundPath($Rect, [int]$Radius) {
   $d = $Radius * 2
@@ -1317,15 +1500,22 @@ function Add-SlimScrollbar($Ctrl, $Track, $Thumb, $ThumbHot, [double]$Scale = 1)
   # step; repaint only when something actually moved
   $sync = {
     if (-not $bar.IsHandleCreated) { return }
-    # the network list hides itself when there is nothing to show
-    # SB_BOTH: columns are sized to fit, so there is nothing to scroll sideways
-    if ($isList) { [void][TsakasNative]::ShowScrollBar($Ctrl.Handle, 3, $false) }
     $m = & $metrics
     $bar.Visible = $Ctrl.Visible -and ($m.Total -gt $m.Per)
     $now = "$($m.Total)/$($m.Per)/$($m.First)"
     if ($now -ne $st.Last) { $st.Last = $now; $bar.Invalidate() }
   }.GetNewClosure()
+  # hiding the native bars also empties the control's scroll range, so the wheel
+  # has nothing left to act on: this is what puts it back
+  $scrollBy = {
+    param($lines)
+    $m = & $metrics
+    if ($m.Total -le $m.Per) { return }
+    & $scrollTo ($m.First + $lines)
+    $bar.Invalidate()
+  }.GetNewClosure()
   $bar | Add-Member -NotePropertyName Sync -NotePropertyValue $sync
+  $bar | Add-Member -NotePropertyName ScrollBy -NotePropertyValue $scrollBy
   $bar
 }
 
@@ -1543,7 +1733,7 @@ function Show-Gui {
   $iconFamily = & $pickFamily 'Segoe Fluent Icons' (& $pickFamily 'Segoe MDL2 Assets' $null)
   $iconFont = if ($iconFamily) { New-Object Drawing.Font($iconFamily, 11) } else { $null }
   $navFont = New-Object Drawing.Font($family, 10)
-  $navIcons = @([char]0xE9D9, [char]0xE964, [char]0xE950, [char]0xE968, [char]0xE8A9)
+  $navIcons = @([char]0xE9D9, [char]0xE964, [char]0xE950, [char]0xE968, [char]0xE8A9, [char]0xE713)
   $navSelFill = [Drawing.Color]::FromArgb(38, 38, 44)
   $navHoverFill = [Drawing.Color]::FromArgb(28, 28, 33)
   $navState = New-Object psobject -Property @{ Selected = 0; Hover = -1 }
@@ -1594,6 +1784,7 @@ function Show-Gui {
     @{ Title = 'Motherboard';            Sub = 'How old the BIOS is, and which drivers Windows is guessing at' }
     @{ Title = 'Network';                Sub = 'Adapter power saving that quietly costs you latency' }
     @{ Title = 'App Optimizer';          Sub = 'Real startup, memory and disk actions for Discord and Spotify' }
+    @{ Title = 'Windows Settings';       Sub = 'The Windows features that quietly cost you performance, as switches' }
   )
 
   $panes = @()
@@ -1664,6 +1855,7 @@ function Show-Gui {
   $tab3 = $bodies[2]
   $tab4 = $bodies[3]
   $tab5 = $bodies[4]
+  $tab6 = $bodies[5]
 
   $selectSection = {
     param($index)
@@ -1675,21 +1867,37 @@ function Show-Gui {
       if ($index -eq 2 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true }
       if ($index -eq 3 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true }
       if ($index -eq 4 -and -not $script:appLoaded)   { & $loadApps;  $script:appLoaded  = $true }
+      if ($index -eq 5) { & $loadSettings }
     } finally { $form.Cursor = 'Default' }
   }
   foreach ($n in $navs) { $n.Add_Click({ param($s, $e) & $selectSection ([int]$s.Tag) }) }
 
   $lv = New-Object Windows.Forms.ListView
   $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false
-  $lv.Location = New-Object Drawing.Point(12, 12)
-  $lv.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 152))
+  $summary = New-Object Windows.Forms.Label
+  $summary.Location = New-Object Drawing.Point(14, 8)
+  $summary.Size = New-Object Drawing.Size($ctlW, 22)
+  $summary.Anchor = 'Top,Left,Right'
+  $summary.ForeColor = $ink
+  $summary.Font = New-Object Drawing.Font($semi, 10)
+  $tab1.Controls.Add($summary)
+
+  $lv.Location = New-Object Drawing.Point(12, 34)
+  $lv.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 174))
   $lv.Anchor = 'Top,Left,Right,Bottom'
   $lv.BorderStyle = 'FixedSingle'
   $lv.BackColor = $card
   [void]$lv.Columns.Add('App Name', 330)
   [void]$lv.Columns.Add('Type', 70)
   [void]$lv.Columns.Add('RAM', 90)
-  [void]$lv.Columns.Add('Suggested', 290)
+  $lv.Tag = 0                       # the name column is the one that stretches
+  $lv.ShowGroups = $true
+  # one argument, because the two-argument form takes a key first, not the header
+  $grpPicks    = New-Object Windows.Forms.ListViewGroup('Worth a look')
+  $grpProcs    = New-Object Windows.Forms.ListViewGroup('Processes')
+  $grpServices = New-Object Windows.Forms.ListViewGroup('Services')
+  $grpDisabled = New-Object Windows.Forms.ListViewGroup('Disabled services')
+  foreach ($grp in @($grpPicks, $grpProcs, $grpServices, $grpDisabled)) { [void]$lv.Groups.Add($grp) }
   $tab1.Controls.Add($lv)
 
   $details = New-Object Windows.Forms.TextBox
@@ -1699,7 +1907,7 @@ function Show-Gui {
   $details.Anchor = 'Left,Right,Bottom'
   $details.BorderStyle = 'FixedSingle'
   $details.ForeColor = $muted
-  $details.Text = 'Scans the processes your CPU/PC runs. Suggests putting services on Manual instead of Automatic and closing apps you are not using. Tick what you want changed, then press Apply.'
+  $details.Text = 'Everything running on this PC, by category. Do not know what something is? Click the information mark after its name, or double-click the row, to look it up.'
   $tab1.Controls.Add($details)
 
   $status = New-Object Windows.Forms.Label
@@ -1722,25 +1930,84 @@ function Show-Gui {
   }
   $btnApply   = & $mkButton 'Apply selected' 12  130
   $btnRefresh = & $mkButton 'Rescan'         150 90
-  $btnUndo    = & $mkButton 'Undo changes'   248 124
-  $btnElev    = & $mkButton 'Restart app as admin' 380 160
+  $btnElev    = & $mkButton 'Restart app as admin' 256 160
+
+  # what the row is, in the words someone would type into a search box
+  $searchRow = {
+    param($f)
+    if (-not $f) { return }
+    $what = $(if ($f.Type -eq 'Service') { "{0} service" -f $f.Label } else { "{0}.exe process" -f $f.Name })
+    Start-Process ("https://www.google.com/search?q=" + [Uri]::EscapeDataString("what is $what windows"))
+  }
+  $lv.Add_DoubleClick({ if ($lv.SelectedItems.Count -gt 0) { & $searchRow $lv.SelectedItems[0].Tag } })
+
+  # An information mark after every row's name. The rows themselves are drawn by
+  # Windows, so this paints over them once they are down, and the same geometry
+  # decides what a click landed on.
+  # The mark is part of the row's own text. Owner-drawing it is not possible here:
+  # the item's default pass paints the whole row, and anything a subitem handler
+  # draws over the name column is discarded.
+  $infoMark = [string][char]0x24D8          # circled i
+  $noPad = [Windows.Forms.TextFormatFlags]::NoPadding
+  $infoRect = {
+    param($item)
+    $b = $item.GetBounds('Label')
+    $full = [Windows.Forms.TextRenderer]::MeasureText($item.Text, $lv.Font, $b.Size, $noPad).Width
+    $mark = [Windows.Forms.TextRenderer]::MeasureText($infoMark, $lv.Font, $b.Size, $noPad).Width
+    New-Object Drawing.Rectangle(($b.Left + $full - $mark - (& $sc 3)), $b.Top, ($mark + (& $sc 6)), $b.Height)
+  }.GetNewClosure()
+
+  # drawn while the second column is painted, which is after the name next to it
+  # is already on screen - a Paint handler would run before the rows and vanish
+  $lv.Add_MouseClick({
+    param($s, $e)
+    $hit = $s.GetItemAt($e.X, $e.Y)
+    if (-not $hit) { return }
+    if ((& $infoRect $hit).Contains($e.Location)) { & $searchRow $hit.Tag }
+  }.GetNewClosure())
+
+  $lv.Add_MouseMove({
+    param($s, $e)
+    $hit = $s.GetItemAt($e.X, $e.Y)
+    $over = ($hit -and (& $infoRect $hit).Contains($e.Location))
+    $want = $(if ($over) { 'Hand' } else { 'Default' })
+    if ("$($s.Cursor)" -ne "$want") { $s.Cursor = $want }
+  }.GetNewClosure())
   & $flat $btnApply $true
   $btnElev.Visible = -not (Test-Admin)
   $btnElev.Anchor = 'Bottom,Right'
   $btnElev.Location = New-Object Drawing.Point(($tab1.ClientSize.Width - $btnElev.Width - 12), $btnRowY)
 
   $refresh = {
+    $rows = @(Get-Findings -All)
+    $lv.BeginUpdate()
     $lv.Items.Clear()
-    foreach ($f in @(Get-Findings)) {
-      $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }))
+    foreach ($f in $rows) {
+      $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }) + '   ' + $infoMark)
       [void]$it.SubItems.Add($f.Type)
       [void]$it.SubItems.Add($(if ($f.RamMB -gt 0) { '{0} MB' -f $f.RamMB } else { '-' }))
-      [void]$it.SubItems.Add($(if ($f.Action -eq 'Kill') { 'Close' } else { 'Set to Manual' }))
+      $it.Group = $(
+        if ($f.Confidence -ne 'Leave') { $grpPicks }
+        elseif ($f.Type -eq 'Process') { $grpProcs }
+        elseif ($f.Mode -eq 'Disabled') { $grpDisabled }
+        else { $grpServices })
       $it.Tag = $f
       [void]$lv.Items.Add($it)
     }
-    $status.Text = "{0} item(s) found.{1}" -f $lv.Items.Count,
-      $(if (Test-Admin) { '' } else { '  Not running as administrator - service changes will be skipped.' })
+    foreach ($grp in @($grpPicks, $grpProcs, $grpServices, $grpDisabled)) {
+      $grp.Header = "{0} ({1})" -f ($grp.Header -replace ' \(\d+\)$', ''), $grp.Items.Count
+    }
+    $lv.EndUpdate()
+
+    $procRows = @($rows | Where-Object { $_.Type -eq 'Process' })
+    $svcRows  = @($rows | Where-Object { $_.Type -eq 'Service' })
+    $running  = ($procRows | Measure-Object Count -Sum).Sum
+    $autoSvc  = @($svcRows | Where-Object { $_.Mode -eq 'Auto' }).Count
+    $todo     = @($rows | Where-Object { $_.Action -ne 'None' }).Count
+    $summary.Text = "{0} processes running in {1} apps   {2} services, {3} start with Windows   {4} worth a look" -f `
+      $running, $procRows.Count, $svcRows.Count, $autoSvc, $todo
+    $status.Text = $(if (Test-Admin) { 'Tick what you want changed, then press Apply.' }
+                     else { 'Not running as administrator - service changes will be skipped.' })
   }
   & $refresh
 
@@ -1749,7 +2016,9 @@ function Show-Gui {
       $f = $lv.SelectedItems[0].Tag
       $details.Text = "{0}`r`n{1}" -f $f.Why,
         $(if ($f.Action -eq 'Kill') { 'Closing it now. It starts again next time you open the app.' }
-          else { 'Start type becomes Manual: Windows starts it only when something asks for it. Reversible with Undo.' })
+          elseif ("$($f.Mode)" -eq 'Disabled') { 'Already disabled - ticking it changes nothing.' }
+          elseif ($f.Target -eq 'Disabled') { 'Start type becomes Disabled: it will not start at all until you turn it back on.' }
+          else { 'Start type becomes Manual: Windows starts it only when something asks for it.' })
     }
   })
 
@@ -1853,8 +2122,18 @@ function Show-Gui {
       [void](& $dialog 'Tick at least one row first.' 'TsakasOptimizer' 'OK')
       return
     }
-    $names = ($items | ForEach-Object { $_.Tag.Label }) -join "`r`n"
-    $ans = & $dialog "Apply to these $($items.Count) item(s)?`r`n`r`n$names" 'TsakasOptimizer' 'YesNo'
+    $names = ($items | ForEach-Object {
+      $t = $_.Tag
+      $(if ($t.Action -eq 'Kill') { "{0} - close it" -f $t.Label }
+        elseif ("$($t.Mode)" -eq 'Disabled') { "{0} - already disabled, nothing to change" -f $t.Label }
+        else { "{0} - start type {1} to {2}" -f $t.Label, $t.Mode, $t.Target })
+    }) -join "`r`n"
+    $system = @($items | Where-Object { $_.Tag.System })
+    $warn = $(if ($system.Count) {
+      "`r`n`r`nWARNING: {0} of these ({1}) are parts of Windows. Touching them can crash Windows, sign you out, or break networking and sound." -f `
+        $system.Count, (($system | ForEach-Object { $_.Tag.Label }) -join ', ')
+    } else { '' })
+    $ans = & $dialog "Apply to these $($items.Count) item(s)?`r`n`r`n$names$warn" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
 
     $freed = 0.0; $errs = @()
@@ -1865,14 +2144,6 @@ function Show-Gui {
     & $refresh
     $status.Text = "Freed about {0} MB.{1}" -f [math]::Round($freed, 1),
       $(if ($errs) { "  Failed: " + ($errs -join ' | ') } else { '' })
-  })
-
-  $btnUndo.Add_Click({
-    if (-not (Test-Path $UndoFile)) { $status.Text = 'Nothing to undo.'; return }
-    if (-not (Test-Admin)) { $status.Text = 'Restart as administrator to undo service changes.'; return }
-    Invoke-Undo
-    & $refresh
-    $status.Text = 'Service start types restored.'
   })
 
   $btnElev.Add_Click({
@@ -2083,7 +2354,7 @@ function Show-Gui {
       catch { $errs += "{0}: {1}" -f $it.Tag.Setting, $_.Exception.Message }
     }
     & $loadNet
-    $ntext.Text = ("Changed {0} setting(s).{1}" -f $done, $(if ($errs) { '  Failed: ' + ($errs -join ' | ') } else { '  Undo them with the Undo button on the first tab.' })) +
+    $ntext.Text = ("Changed {0} setting(s).{1}" -f $done, $(if ($errs) { '  Failed: ' + ($errs -join ' | ') } else { '' })) +
       "`r`n`r`n" + $ntext.Text
   })
 
@@ -2160,6 +2431,135 @@ function Show-Gui {
 
   $script:appLoaded = $false
 
+  # ---- Windows Settings ----
+  # A switch, not a tick box: these apply the moment they are flipped, the way
+  # the Settings app they mirror does.
+  $togglePaint = {
+    param($s, $e)
+    $g = $e.Graphics
+    $g.Clear($card)
+    $g.SmoothingMode = 'AntiAlias'
+    $on = [bool]$s.Tag
+    $track = New-Object Drawing.Rectangle(0, (& $sc 2), ($s.Width - 1), ($s.Height - (& $sc 5)))
+    $path = New-RoundPath $track ([int]($track.Height / 2))
+    if ($on) {
+      $b = New-Object Drawing.SolidBrush($accentFill)
+      $g.FillPath($b, $path); $b.Dispose()
+    } else {
+      $pen = New-Object Drawing.Pen($muted, 1)
+      $g.DrawPath($pen, $path); $pen.Dispose()
+    }
+    $inset = & $sc 5
+    $knob = $track.Height - 2 * $inset
+    $kx = $(if ($on) { $track.Right - $knob - $inset } else { $track.Left + $inset })
+    $kb = New-Object Drawing.SolidBrush($(if ($on) { $white } else { $muted }))
+    $g.FillEllipse($kb, $kx, ($track.Top + $inset), $knob, $knob); $kb.Dispose()
+    if ($s.Focused) {
+      $fr = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+      $fp = New-RoundPath $fr ([int]($s.Height / 2))
+      $fpen = New-Object Drawing.Pen($ink, 1)
+      $g.DrawPath($fpen, $fp); $fpen.Dispose(); $fp.Dispose()
+    }
+    $path.Dispose()
+  }.GetNewClosure()
+
+  $setStatus = New-Object Windows.Forms.Label
+  $setList = New-Object Windows.Forms.Panel
+  $setList.Location = New-Object Drawing.Point(12, 12)
+  $setList.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 34))
+  $setList.Anchor = 'Top,Left,Right,Bottom'
+  $setList.BackColor = $panel
+  $setList.AutoScroll = $true
+  $tab6.Controls.Add($setList)
+
+  $toggles = @()
+  $settings = @(Get-WinSettings)
+  for ($i = 0; $i -lt $settings.Count; $i++) {
+    $row = New-Object Windows.Forms.Panel
+    $row.Location = New-Object Drawing.Point(0, ($i * 78))
+    $row.Size = New-Object Drawing.Size(($ctlW - 20), 70)
+    $row.Anchor = 'Top,Left,Right'
+    $row.BackColor = $card
+    $setList.Controls.Add($row)
+    Set-Rounded $row 10
+
+    $rowTitle = New-Object Windows.Forms.Label
+    $rowTitle.Text = $settings[$i].Title
+    $rowTitle.Font = New-Object Drawing.Font($semi, 10)
+    $rowTitle.ForeColor = $ink
+    $rowTitle.AutoSize = $true
+    $rowTitle.Location = New-Object Drawing.Point(16, 12)
+    $row.Controls.Add($rowTitle)
+
+    $rowSub = New-Object Windows.Forms.Label
+    $rowSub.Text = $settings[$i].Sub
+    $rowSub.Font = New-Object Drawing.Font($small, 9)
+    $rowSub.ForeColor = $muted
+    $rowSub.AutoSize = $false
+    $rowSub.Size = New-Object Drawing.Size(($row.Width - 110), 20)
+    # measured, not guessed: a semibold 10pt line is taller than it looks
+    $rowSub.Location = New-Object Drawing.Point(16, ($rowTitle.Bottom + 3))
+    $rowSub.Anchor = 'Top,Left,Right'
+    $row.Controls.Add($rowSub)
+
+    $tog = New-Object Windows.Forms.Button
+    $tog.Size = New-Object Drawing.Size(46, 26)
+    $tog.Location = New-Object Drawing.Point(($row.Width - 62), 22)
+    $tog.Anchor = 'Top,Right'
+    $tog.FlatStyle = 'Flat'
+    $tog.FlatAppearance.BorderSize = 0
+    $tog.FlatAppearance.MouseOverBackColor = $card
+    $tog.FlatAppearance.MouseDownBackColor = $card
+    $tog.BackColor = $card
+    $tog.UseVisualStyleBackColor = $false
+    $tog.Cursor = 'Hand'
+    $tog.AccessibleRole = 'CheckButton'
+    $tog.AccessibleName = $settings[$i].Title
+    $tog.Tag = $false
+    $tog.Add_Paint($togglePaint)
+    $tog.Add_GotFocus({ param($s, $e) $s.Invalidate() })
+    $tog.Add_LostFocus({ param($s, $e) $s.Invalidate() })
+    $row.Controls.Add($tog)
+    $toggles += $tog
+  }
+
+  $setStatus.Location = New-Object Drawing.Point(12, $btnRowY)
+  $setStatus.Size = New-Object Drawing.Size($ctlW, 30)
+  $setStatus.Anchor = 'Left,Right,Bottom'
+  $setStatus.ForeColor = $muted
+  $setStatus.Text = 'Each switch applies the moment you flip it, the same as the Settings app.'
+  $tab6.Controls.Add($setStatus)
+
+  $loadSettings = {
+    for ($k = 0; $k -lt $settings.Count; $k++) {
+      $state = $false
+      try { $state = [bool](& $settings[$k].Read) } catch { }
+      $toggles[$k].Tag = $state
+      $toggles[$k].Invalidate()
+    }
+  }
+
+  for ($i = 0; $i -lt $settings.Count; $i++) {
+    $entry = $settings[$i]
+    $toggles[$i].Add_Click({
+      param($s, $e)
+      $want = -not [bool]$s.Tag
+      if ($entry.Admin -and -not (Test-Admin)) {
+        [void](& $dialog "$($entry.Title) is a machine-wide setting, so it needs Administrator. Use 'Restart app as admin' on the first tab." 'Administrator needed' 'OK')
+        return
+      }
+      try {
+        & $entry.Write $want
+        $s.Tag = $want
+        $s.Invalidate()
+        $setStatus.Text = "{0} is now {1}." -f $entry.Title, $(if ($want) { 'on' } else { 'off' })
+      } catch {
+        [void](& $dialog "Could not change $($entry.Title): $($_.Exception.Message)" 'TsakasOptimizer' 'OK')
+        & $loadSettings
+      }
+    }.GetNewClosure())
+  }
+
   # ---- every list and text pane becomes a rounded white card ----
   $rowHeight = New-Object Windows.Forms.ImageList
   $rowHeight.ImageSize = New-Object Drawing.Size(1, (& $sc 28))
@@ -2230,17 +2630,19 @@ function Show-Gui {
     $checkImages.Images.Add($bmp)
   }
 
-  # the last column takes whatever width is left
+  # one column takes whatever width is left - the last one, or the one the list
+  # named in its Tag
   $fillLast = {
     param($s, $e)
     $n = $s.Columns.Count
     if ($n -eq 0) { return }
+    $grow = $(if ($s.Tag -is [int]) { $s.Tag } else { $n - 1 })
     $used = 0
-    for ($i = 0; $i -lt $n - 1; $i++) { $used += $s.Columns[$i].Width }
+    for ($i = 0; $i -lt $n; $i++) { if ($i -ne $grow) { $used += $s.Columns[$i].Width } }
     # exactly to the edge: any gap is header the owner-draw never reaches, and
     # the system paints that strip white
     $room = $s.ClientSize.Width - $used
-    $s.Columns[$n - 1].Width = [Math]::Max(60, $room)
+    $s.Columns[$grow].Width = [Math]::Max(60, $room)
   }
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
     foreach ($col in $l.Columns) { $col.Width = & $sc $col.Width }
@@ -2258,9 +2660,29 @@ function Show-Gui {
   # (locked-down PCs), the app just keeps the plain look.
   try {
     if (-not ('TsakasNative' -as [type])) {
-      Add-Type -TypeDefinition @'
+      Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+// A list asks for its scrollbars back on every layout pass, which a timer can
+// only chase. This answers at the point Windows measures the frame, so the
+// native bars never get painted and only the drawn one shows.
+public class TsakasScroll : NativeWindow {
+  [DllImport("user32.dll")] private static extern bool ShowScrollBar(IntPtr hWnd, int bar, bool show);
+  private const int WM_NCCALCSIZE = 0x0083;
+  private const int SB_BOTH = 3;
+  protected override void WndProc(ref Message m) {
+    if (m.Msg == WM_NCCALCSIZE) { ShowScrollBar(m.HWnd, SB_BOTH, false); }
+    base.WndProc(ref m);
+  }
+  public static void Attach(Control c) {
+    TsakasScroll hook = new TsakasScroll();
+    hook.AssignHandle(c.Handle);
+    ShowScrollBar(c.Handle, SB_BOTH, false);
+  }
+}
+
 public static class TsakasNative {
   [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
   public static extern int SetWindowTheme(IntPtr hWnd, string appName, string idList);
@@ -2275,12 +2697,17 @@ public static class TsakasNative {
   public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
   [DllImport("user32.dll")]
   public static extern bool ShowScrollBar(IntPtr hWnd, int bar, bool show);
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern bool SystemParametersInfo(uint action, uint param, IntPtr vparam, uint winIni);
 }
 '@
     }
     # 2 = force dark; this is what actually darkens checkboxes and scrollbars
     try { [void][TsakasNative]::SetPreferredAppMode(2); [TsakasNative]::RefreshImmersiveColorPolicyState() } catch { }
+    # the settings rows scroll in a plain panel, whose scrollbar is light by default
+    [void][TsakasNative]::SetWindowTheme($setList.Handle, 'DarkMode_Explorer', $null)
     foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
+      [TsakasScroll]::Attach($l)
       [void][TsakasNative]::SetWindowTheme($l.Handle, 'DarkMode_Explorer', $null)
       # the header is its own window, and keeps a light background unless themed too
       $hdr = [TsakasNative]::SendMessage($l.Handle, 0x101F, [IntPtr]::Zero, [IntPtr]::Zero)   # LVM_GETHEADER
@@ -2324,6 +2751,14 @@ public static class TsakasNative {
     $bars[$c] = Add-SlimScrollbar $c $barTrack $barThumb $barHot $dpiScale
   }
   & $fitList $mlv $mtextCard 0.4        # memory loaded before the bars existed
+  foreach ($c in @($bars.Keys)) {
+    $c.Add_MouseWheel({
+      param($s, $e)
+      $step = [Windows.Forms.SystemInformation]::MouseWheelScrollLines
+      if ($step -le 0 -or $step -gt 10) { $step = 3 }
+      & $bars[$s].ScrollBy ([int](-$e.Delta / 120) * $step)
+    })
+  }
   $barSyncs = @($bars.Values | ForEach-Object { $_.Sync })
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { & $fillLast $l $null }
   $barTimer = New-Object Windows.Forms.Timer
@@ -2361,6 +2796,16 @@ function Invoke-SelfTest {
     @{N = 'AnyDesk is not protected';         R = (-not (Test-Match 'AnyDesk' $Protected))}
     @{N = 'services match on display name';   R = ((Get-Suggestion 'gupdate' 'Google Update Service (gupdate)') -ne $null)}
     @{N = 'scan returns objects, not errors'; R = ((@(Get-Findings) | Where-Object { $_ -isnot [pscustomobject] }).Count -eq 0)}
+    @{N = 'the full list is longer than the flagged one'; R = (@(Get-Findings -All).Count -gt @(Get-Findings).Count)}
+    @{N = 'the full list still picks the same rows';      R = (@(Get-Findings -All | Where-Object { $_.Confidence -ne 'Leave' }).Count -eq @(Get-Findings).Count)}
+    @{N = 'every row can be ticked';                      R = (@(Get-Findings -All | Where-Object { $_.Action -ne 'Kill' -and $_.Action -ne 'Service' }).Count -eq 0)}
+    @{N = 'an automatic service steps down to Manual';     R = (@(Get-Findings -All | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Auto' -and $_.Target -ne 'Manual' }).Count -eq 0)}
+    @{N = 'a manual service steps down to Disabled';       R = (@(Get-Findings -All | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Manual' -and $_.Target -ne 'Disabled' }).Count -eq 0)}
+    @{N = 'a disabled service has nowhere left to go';     R = (@(Get-Findings -All | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Disabled' -and $_.Target -ne '' }).Count -eq 0)}
+    @{N = 'every process can be closed by hand';          R = (@(Get-Findings -All | Where-Object { $_.Type -eq 'Process' -and $_.Action -ne 'Kill' }).Count -eq 0)}
+    @{N = 'system processes are listed but never picked'; R = (& {
+        $rows = @(Get-Findings -All | Where-Object { $_.Type -eq 'Process' -and (Test-Match $_.Name $Protected) })
+        ($rows.Count -gt 0) -and (@($rows | Where-Object { -not $_.System -or $_.Confidence -ne 'Leave' }).Count -eq 0) })}
   )
 
   # fake sticks, so these do not depend on this PC
@@ -2455,6 +2900,32 @@ function Invoke-SelfTest {
           @(Read-UndoLog $f).Count -eq 1
         } finally { Remove-Item $f -ErrorAction SilentlyContinue }
       })}
+    # windows settings
+    @{N = 'every switch has a title and a read'; R = (@(Get-WinSettings | Where-Object { $_.Title -and $_.Sub -and $_.Read -and $_.Write }).Count -eq @(Get-WinSettings).Count)}
+    @{N = 'every switch reads a true/false';     R = (@(Get-WinSettings | Where-Object { (& $_.Read) -is [bool] }).Count -eq @(Get-WinSettings).Count)}
+    @{N = 'only machine-wide ones need admin';   R = (@(Get-WinSettings | Where-Object { $_.Admin }).Count -eq 2)}
+    @{N = 'a registry write can be undone';      R = (& {
+        $key = 'HKCU:\Software\TsakasOptimizerSelfTest'
+        $log = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
+        $saved = $script:UndoFile
+        try {
+          $script:UndoFile = $log
+          [void](New-Item -Path $key -Force)
+          New-ItemProperty -Path $key -Name 'Kept' -Value 7 -PropertyType DWord -Force | Out-Null
+          Set-RegValueLogged $key 'Kept' 0 'DWord'          # had a value before
+          Set-RegValueLogged $key 'Added' 0 'DWord'         # brand new value
+          $entries = @(Read-UndoLog $log)
+          foreach ($e in $entries) {
+            if ($e.Existed) { New-ItemProperty -Path $e.Path -Name $e.Name -Value $e.Previous -PropertyType $e.Kind -Force | Out-Null }
+            else { Remove-ItemProperty -Path $e.Path -Name $e.Name -ErrorAction SilentlyContinue }
+          }
+          ((Get-RegValue $key 'Kept') -eq 7) -and ($null -eq (Get-RegValue $key 'Added'))
+        } finally {
+          $script:UndoFile = $saved
+          Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $log -ErrorAction SilentlyContinue
+        }
+      })}
     @{N = 'AM5 desktop chip is detected';        R = ((Test-Am5 'AMD Ryzen 7 7800X3D 8-Core Processor') -and (Test-Am5 'AMD Ryzen 5 8600G w/ Radeon Graphics') -and (Test-Am5 'AMD Ryzen 9 9950X 16-Core'))}
     @{N = 'mobile Ryzen is not called AM5';      R = (-not (Test-Am5 'AMD Ryzen 7 7735HS with Radeon') -and -not (Test-Am5 'AMD Ryzen 9 7945HX'))}
     @{N = 'AM4 and Intel are not called AM5';    R = (-not (Test-Am5 'AMD Ryzen 5 5600X 6-Core') -and -not (Test-Am5 'Intel Core i9-14900K'))}
@@ -2521,6 +2992,6 @@ Write-Host ''
 if ($Report) {
   Write-Host ("  {0} item(s) flagged. Run without -Report to act on them." -f $findings.Count) -ForegroundColor Cyan
 } else {
-  Write-Host ("  Done. Freed about {0} MB. Undo service changes with: .\TsakasOptimizer.ps1 -Undo" -f [math]::Round($freed,1)) -ForegroundColor Cyan
+  Write-Host ("  Done. Freed about {0} MB." -f [math]::Round($freed,1)) -ForegroundColor Cyan
 }
 Write-Host ''
