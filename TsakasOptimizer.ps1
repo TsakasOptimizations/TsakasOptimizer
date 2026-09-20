@@ -25,7 +25,7 @@ if (-not ($Console -or $Report -or $Undo -or $SelfTest)) {
   } catch { }
 }
 
-$Version = '1.8.0'
+$Version = '1.8.1'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -832,13 +832,34 @@ function Get-DriverInfo {
     foreach ($d in $g.Rows) {
       $inf = $d.InfName
       $hwid = $(if ($d.HardWareID) { @($d.HardWareID)[0] } else { '' })
+      $version = $(if ($g.Cat -eq 'Graphics') { Get-GpuVersion $d.DriverProviderName $d.DriverVersion } else { $d.DriverVersion })
       [void]$rows.Add([pscustomobject]@{
         Category = $g.Cat; Device = $d.DeviceName; Provider = $d.DriverProviderName
-        Version = $d.DriverVersion; Date = $d.DriverDate
+        Version = $version; Date = $d.DriverDate
         Note = (Get-DriverNote $d.DriverProviderName $d.DriverDate $inf $hwid) })
     }
   }
   $rows
+}
+
+# Windows keeps its own version for GPU drivers, and it is not the number the
+# vendor publishes. NVIDIA's is the last five digits (32.0.16.1088 -> 610.88);
+# Intel drops the two Windows components (32.0.101.6314 -> 101.6314). AMD's
+# Adrenalin version is not derivable from it, so that one is left as it is.
+function Get-GpuVersion([string]$Provider, [string]$Version) {
+  if (-not $Version) { return $Version }
+  if ($Provider -like 'NVIDIA*') {
+    $d = ($Version -replace '\D', '')
+    if ($d.Length -ge 5) {
+      $last = $d.Substring($d.Length - 5)
+      return ("{0}.{1}" -f $last.Substring(0, 3), $last.Substring(3, 2))
+    }
+  }
+  if ($Provider -like 'Intel*') {
+    $parts = $Version -split '\.'
+    if ($parts.Count -eq 4) { return ("{0}.{1}" -f $parts[2], $parts[3]) }
+  }
+  return $Version
 }
 
 function Get-DriverNote([string]$Provider, $Date, [string]$Inf, [string]$HardwareId) {
@@ -2397,6 +2418,9 @@ function Invoke-SelfTest {
     @{N = 'a 2 year old BIOS is flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-24);AgeMonths=24;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'over 18 months old'}
     @{N = 'a recent BIOS is not flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'Recent BIOS'}
     @{N = 'AM5 gets the AGESA note';              R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'AGESA'}
+    @{N = 'NVIDIA version is the published one';  R = ((Get-GpuVersion 'NVIDIA' '32.0.16.1088') -eq '610.88' -and (Get-GpuVersion 'NVIDIA' '31.0.15.3699') -eq '536.99')}
+    @{N = 'Intel version drops the Windows part'; R = ((Get-GpuVersion 'Intel Corporation' '32.0.101.6314') -eq '101.6314')}
+    @{N = 'AMD version is left untouched';        R = ((Get-GpuVersion 'Advanced Micro Devices, Inc.' '31.0.24033.1003') -eq '31.0.24033.1003')}
     @{N = 'generic Microsoft driver is called out'; R = ((Get-DriverNote 'Microsoft' (Get-Date) 'oem42.inf' 'PCI\VEN_8086') -match 'generic Windows driver')}
     @{N = 'an old driver is called out';          R = ((Get-DriverNote 'Realtek' ((Get-Date).AddYears(-4)) 'oem11.inf' '') -match 'over 3 years old')}
     @{N = 'a current vendor driver is silent';    R = ((Get-DriverNote 'Realtek' (Get-Date) 'oem11.inf' '') -eq '')}
