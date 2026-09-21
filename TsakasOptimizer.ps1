@@ -24,7 +24,7 @@ if (-not ($Console -or $Report -or $Undo -or $SelfTest)) {
   } catch { }
 }
 
-$Version = '1.12.0'
+$Version = '1.13.1'
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
@@ -77,6 +77,10 @@ function Update-SideFiles {
       $s.WorkingDirectory = $dir
       if (Test-Path $icon) { $s.IconLocation = $icon }
       $s.Save()
+      # Save() rewrites the header, so the elevation flag goes back on after it
+      $bytes = [IO.File]::ReadAllBytes($lnk)
+      $bytes[0x15] = $bytes[0x15] -bor 0x20
+      [IO.File]::WriteAllBytes($lnk, $bytes)
     } catch { }
   }
 }
@@ -449,6 +453,12 @@ function Invoke-Undo {
         }
         'NetProperty' {
           Set-NetAdapterAdvancedProperty -Name $e.Adapter -DisplayName $e.Name -DisplayValue $e.Previous -ErrorAction Stop
+        }
+        'StartupFile' {
+          Move-Item -Path $e.Data -Destination $e.Name -Force -ErrorAction Stop
+        }
+        'Task' {
+          Enable-ScheduledTask -TaskName $e.Name -TaskPath $e.Data -ErrorAction Stop | Out-Null
         }
         'RegValue' {
           if ($e.Existed) {
@@ -1096,80 +1106,282 @@ function Invoke-NetFix($Row) {
 }
 
 # --- app optimizer ----------------------------------------------------------
+# Folder sizes are read once per scan: walking a shader cache costs real time,
+# so the number is worth showing rather than "3 folder(s)".
+function Get-FolderSize([string]$Path) {
+  if (-not $Path -or -not (Test-Path $Path)) { return 0 }
+  $total = 0
+  try {
+    foreach ($f in [IO.Directory]::EnumerateFiles($Path, '*', [IO.SearchOption]::AllDirectories)) {
+      try { $total += (New-Object IO.FileInfo($f)).Length } catch { }
+    }
+  } catch { }
+  return $total
+}
+
+function Format-Size([long]$Bytes) {
+  if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
+  if ($Bytes -ge 1MB) { return ('{0:N0} MB' -f ($Bytes / 1MB)) }
+  if ($Bytes -gt 0)   { return ('{0:N0} KB' -f ($Bytes / 1KB)) }
+  return '0'
+}
+
+function Get-SteamPath {
+  $v = (Get-ItemProperty 'HKCU:\SOFTWARE\Valve\Steam' -Name SteamPath -ErrorAction SilentlyContinue).SteamPath
+  if ($v) { return $v -replace '/', '\' }
+  return $null
+}
+
+# Apps worth offering the same three actions to: stop it starting with Windows,
+# close it now, clear the cache it rebuilds by itself.
 function Get-AppPlans {
+  $steam = Get-SteamPath
   @(
     [pscustomobject]@{ Name = 'Discord'; Process = 'Discord'; Match = 'Discord'; Cache = @(
-      (Join-Path $env:APPDATA 'discord\Cache'),
-      (Join-Path $env:APPDATA 'discord\Code Cache'),
-      (Join-Path $env:APPDATA 'discord\GPUCache'),
-      (Join-Path $env:LOCALAPPDATA 'Discord\Cache')) }
+      (Join-Path $env:APPDATA 'discord\Cache'), (Join-Path $env:APPDATA 'discord\Code Cache'),
+      (Join-Path $env:APPDATA 'discord\GPUCache'), (Join-Path $env:LOCALAPPDATA 'Discord\Cache')) }
     [pscustomobject]@{ Name = 'Spotify'; Process = 'Spotify'; Match = 'Spotify'; Cache = @(
-      (Join-Path $env:LOCALAPPDATA 'Spotify\Data'),
-      (Join-Path $env:LOCALAPPDATA 'Spotify\Storage')) }
+      (Join-Path $env:LOCALAPPDATA 'Spotify\Data'), (Join-Path $env:LOCALAPPDATA 'Spotify\Storage')) }
+    [pscustomobject]@{ Name = 'Steam'; Process = 'steam'; Match = 'Steam'; Cache = @(
+      $(if ($steam) { Join-Path $steam 'steamapps\shadercache' }),
+      $(if ($steam) { Join-Path $steam 'appcache\httpcache' })) }
+    [pscustomobject]@{ Name = 'Steam web helper'; Process = 'steamwebhelper'; Match = ''; Cache = @() }
+    [pscustomobject]@{ Name = 'Epic Games Launcher'; Process = 'EpicGamesLauncher'; Match = 'EpicGames'; Cache = @(
+      (Join-Path $env:LOCALAPPDATA 'EpicGamesLauncher\Saved\webcache')) }
+    [pscustomobject]@{ Name = 'Battle.net'; Process = 'Battle.net'; Match = 'Battle.net'; Cache = @(
+      (Join-Path $env:LOCALAPPDATA 'Battle.net\Cache')) }
+    [pscustomobject]@{ Name = 'EA app'; Process = 'EADesktop'; Match = 'EADesktop'; Cache = @(
+      (Join-Path $env:LOCALAPPDATA 'Electronic Arts\EA Desktop\cache')) }
+    [pscustomobject]@{ Name = 'Riot Client'; Process = 'RiotClientServices'; Match = 'Riot'; Cache = @() }
+    [pscustomobject]@{ Name = 'GOG Galaxy'; Process = 'GalaxyClient'; Match = 'GalaxyClient'; Cache = @() }
+    [pscustomobject]@{ Name = 'Ubisoft Connect'; Process = 'upc'; Match = 'Ubisoft'; Cache = @(
+      (Join-Path $env:LOCALAPPDATA 'Ubisoft Game Launcher\cache')) }
+    [pscustomobject]@{ Name = 'Microsoft Teams'; Process = 'ms-teams'; Match = 'Teams'; Cache = @(
+      (Join-Path $env:LOCALAPPDATA 'Packages\MSTeams_8wekyb3d8bbwe\LocalCache'),
+      (Join-Path $env:APPDATA 'Microsoft\Teams\Cache')) }
+    [pscustomobject]@{ Name = 'Slack'; Process = 'slack'; Match = 'Slack'; Cache = @(
+      (Join-Path $env:APPDATA 'Slack\Cache'), (Join-Path $env:APPDATA 'Slack\Code Cache')) }
+    [pscustomobject]@{ Name = 'Zoom'; Process = 'Zoom'; Match = 'Zoom'; Cache = @(
+      (Join-Path $env:APPDATA 'Zoom\data')) }
+    [pscustomobject]@{ Name = 'OneDrive'; Process = 'OneDrive'; Match = 'OneDrive'; Cache = @() }
+    [pscustomobject]@{ Name = 'NVIDIA App'; Process = 'NVIDIA app'; Match = 'NVIDIA'; Cache = @(
+      (Join-Path $env:LOCALAPPDATA 'NVIDIA Corporation\NV_Cache')) }
+    [pscustomobject]@{ Name = 'Razer Synapse'; Process = 'Razer Synapse 3'; Match = 'Razer'; Cache = @() }
+    [pscustomobject]@{ Name = 'Logitech G HUB'; Process = 'lghub'; Match = 'lghub'; Cache = @() }
+    [pscustomobject]@{ Name = 'Corsair iCUE'; Process = 'iCUE'; Match = 'iCUE'; Cache = @() }
+    [pscustomobject]@{ Name = 'Armoury Crate'; Process = 'ArmouryCrate.UserSessionHelper'; Match = 'Armoury'; Cache = @() }
+    [pscustomobject]@{ Name = 'qBittorrent'; Process = 'qbittorrent'; Match = 'qbittorrent'; Cache = @() }
+    [pscustomobject]@{ Name = 'Adobe Creative Cloud'; Process = 'Creative Cloud'; Match = 'Adobe'; Cache = @(
+      (Join-Path $env:APPDATA 'Adobe\Common\Media Cache Files')) }
   )
 }
 
+# Caches that belong to Windows or to the graphics stack rather than to one app.
+# All of them are rebuilt on demand; none of them hold anything you typed.
+function Get-SystemCaches {
+  $steam = Get-SteamPath
+  @(
+    [pscustomobject]@{ Name = 'Delivery Optimization cache'; Admin = $true
+      What = 'Update chunks kept to share with other PCs. Windows refills it as needed.'
+      Paths = @(Join-Path $env:SystemRoot 'SoftwareDistribution\DeliveryOptimization') }
+    [pscustomobject]@{ Name = 'Windows Update cache'; Admin = $true
+      What = 'Installers for updates that are already applied. Windows downloads again if it ever needs them.'
+      Paths = @(Join-Path $env:SystemRoot 'SoftwareDistribution\Download') }
+    [pscustomobject]@{ Name = 'NVIDIA shader cache'; Admin = $false
+      What = 'Compiled shaders. Rebuilt the next time you play, at the cost of some first-run stutter.'
+      Paths = @((Join-Path $env:LOCALAPPDATA 'NVIDIA\DXCache'), (Join-Path $env:LOCALAPPDATA 'NVIDIA\GLCache')) }
+    [pscustomobject]@{ Name = 'DirectX shader cache'; Admin = $false
+      What = 'Same thing, kept by Windows itself. Safe to clear when a game stutters or crashes on load.'
+      Paths = @(Join-Path $env:LOCALAPPDATA 'D3DSCache') }
+    [pscustomobject]@{ Name = 'Steam shader cache'; Admin = $false
+      What = 'Shaders Steam pre-compiled for your games. Steam downloads them again.'
+      Paths = @($(if ($steam) { Join-Path $steam 'steamapps\shadercache' })) }
+    [pscustomobject]@{ Name = 'Temporary files'; Admin = $false
+      What = 'Whatever installers and apps left behind in your temp folder.'
+      Paths = @($env:TEMP) }
+    [pscustomobject]@{ Name = 'Windows temporary files'; Admin = $true
+      What = 'The machine-wide temp folder. Files in use are skipped.'
+      Paths = @(Join-Path $env:SystemRoot 'Temp') }
+    [pscustomobject]@{ Name = 'Crash dumps'; Admin = $false
+      What = 'Memory dumps written when something crashed. Only useful while debugging that crash.'
+      Paths = @(Join-Path $env:LOCALAPPDATA 'CrashDumps') }
+  )
+}
+
+# Store apps this tool offers to remove. A curated list on purpose: enumerating
+# every package would put things like the Store itself and the frameworks apps
+# depend on in front of someone at two in the morning.
+$RemovableStoreApps = @(
+  @{ Id = 'Clipchamp.Clipchamp';                   Label = 'Clipchamp' }
+  @{ Id = 'Microsoft.BingNews';                    Label = 'Bing News' }
+  @{ Id = 'Microsoft.BingWeather';                 Label = 'Weather' }
+  @{ Id = 'Microsoft.BingSearch';                  Label = 'Web search in Start' }
+  @{ Id = 'Microsoft.GamingApp';                   Label = 'Xbox app' }
+  @{ Id = 'Microsoft.XboxGamingOverlay';           Label = 'Xbox Game Bar' }
+  @{ Id = 'Microsoft.XboxSpeechToTextOverlay';     Label = 'Xbox speech to text' }
+  @{ Id = 'Microsoft.MicrosoftSolitaireCollection';Label = 'Solitaire Collection' }
+  @{ Id = 'Microsoft.People';                      Label = 'People' }
+  @{ Id = 'Microsoft.WindowsFeedbackHub';          Label = 'Feedback Hub' }
+  @{ Id = 'Microsoft.GetHelp';                     Label = 'Get Help' }
+  @{ Id = 'Microsoft.Getstarted';                  Label = 'Tips' }
+  @{ Id = 'Microsoft.MicrosoftOfficeHub';          Label = 'Microsoft 365 hub' }
+  @{ Id = 'Microsoft.MixedReality.Portal';         Label = 'Mixed Reality Portal' }
+  @{ Id = 'Microsoft.SkypeApp';                    Label = 'Skype' }
+  @{ Id = 'Microsoft.Todos';                       Label = 'To Do' }
+  @{ Id = 'Microsoft.ZuneMusic';                   Label = 'Media Player' }
+  @{ Id = 'Microsoft.ZuneVideo';                   Label = 'Films and TV' }
+  @{ Id = 'MicrosoftTeams';                        Label = 'Teams (personal)' }
+  @{ Id = 'MSTeams';                               Label = 'Teams (new)' }
+  @{ Id = 'Microsoft.Copilot';                     Label = 'Copilot' }
+  @{ Id = 'Microsoft.549981C3F5F10';               Label = 'Cortana' }
+)
+
+$StartupRunKeys = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
+  'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run'
+)
+
+$StartupParked = Join-Path $Root 'startup-disabled'
+
 function Get-AppStartupEntries {
   $entries = New-Object System.Collections.ArrayList
-  foreach ($key in @(
-    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
-    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
-    'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run')) {
+  foreach ($key in $StartupRunKeys) {
     if (-not (Test-Path $key)) { continue }
     $item = Get-ItemProperty $key -ErrorAction SilentlyContinue
     foreach ($name in $item.PSObject.Properties.Name) {
-      if ($name -in 'PSPath','PSParentPath','PSChildName','PSDrive','PSProvider') { continue }
-      [void]$entries.Add([pscustomobject]@{ Key = $key; Name = $name; Data = [string]$item.$name })
+      if ($name -in 'PSPath','PSParentPath','PSChildName','PSDrive','PSProvider','(default)') { continue }
+      if (-not $item.$name) { continue }
+      [void]$entries.Add([pscustomobject]@{
+        Kind = 'Run'; Key = $key; Name = $name; Data = [string]$item.$name
+        Where = $(if ($key -like 'HKCU:*') { 'Run key (this account)' } else { 'Run key (all accounts)' }) })
     }
+  }
+  foreach ($dir in @([Environment]::GetFolderPath('Startup'), [Environment]::GetFolderPath('CommonStartup'))) {
+    foreach ($f in (Get-ChildItem $dir -File -ErrorAction SilentlyContinue)) {
+      [void]$entries.Add([pscustomobject]@{
+        Kind = 'File'; Key = $dir; Name = $f.BaseName; Data = $f.FullName; Where = 'Startup folder' })
+    }
+  }
+  # scheduled tasks that fire at logon, which is where installers hide nowadays
+  foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+    if ($t.State -eq 'Disabled') { continue }
+    if ($t.TaskPath -like '\Microsoft\Windows\*') { continue }      # Windows' own housekeeping
+    if (@($t.Triggers.CimClass.CimClassName) -notcontains 'MSFT_TaskLogonTrigger') { continue }
+    [void]$entries.Add([pscustomobject]@{
+      Kind = 'Task'; Key = $t.TaskPath; Name = $t.TaskName
+      Data = ($t.Actions | ForEach-Object { $_.Execute }) -join ' '; Where = 'Scheduled task at logon' })
   }
   $entries
 }
 
 function Get-AppFindings {
-  $startup = @(Get-AppStartupEntries)
   $rows = New-Object System.Collections.ArrayList
+
+  # 1. everything that starts with Windows
+  foreach ($e in @(Get-AppStartupEntries)) {
+    [void]$rows.Add([pscustomobject]@{
+      App = $e.Name; Action = 'Startup'; Status = $e.Where; Target = 'Disabled'
+      Effect = 'Stops it opening with Windows. Launch it yourself when you need it.'
+      Why = "$($e.Where): $($e.Data)"; Data = $e; Plan = $null; Bytes = 0 })
+  }
+
+  # 2. the apps in the catalog that are running or have a cache
   foreach ($app in Get-AppPlans) {
-    $start = @($startup | Where-Object { $_.Name -match $app.Match -or $_.Data -match $app.Match }) | Select-Object -First 1
     $processes = @(Get-Process -Name $app.Process -ErrorAction SilentlyContinue)
-    $cache = @($app.Cache | Where-Object { Test-Path $_ } | Select-Object -Unique)
-    if ($start) {
-      [void]$rows.Add([pscustomobject]@{
-        App = $app.Name; Action = 'Startup'; Status = 'Enabled'; Target = 'Disabled'
-        Effect = 'Stops it opening with Windows. Launch it normally when you need it.'
-        Why = "Startup entry: $($start.Name)"; Data = $start; Plan = $app
-      })
-    }
     if ($processes.Count -gt 0) {
+      $ram = [math]::Round((($processes | Measure-Object WorkingSet64 -Sum).Sum) / 1MB, 0)
       [void]$rows.Add([pscustomobject]@{
-        App = $app.Name; Action = 'Close'; Status = "$($processes.Count) process(es) running"; Target = 'Closed'
-        Effect = 'Frees the app''s current RAM/CPU. It will reopen when you launch it.'
-        Why = 'The app is currently running.'; Data = $null; Plan = $app
-      })
+        App = $app.Name; Action = 'Close'; Status = "$($processes.Count) running, $ram MB"; Target = 'Closed'
+        Effect = 'Frees the RAM and CPU it is using now. It reopens when you launch it.'
+        Why = 'The app is running right now.'; Data = $null; Plan = $app; Bytes = 0 })
     }
-    if ($cache.Count -gt 0) {
-      [void]$rows.Add([pscustomobject]@{
-        App = $app.Name; Action = 'Cache'; Status = "$($cache.Count) folder(s) present"; Target = 'Removed'
-        Effect = 'Frees disk space. The app rebuilds this cache; it is not a permanent speed boost.'
-        Why = ('Rebuildable cache: {0}' -f ($cache -join ', ')); Data = $cache; Plan = $app
-      })
+    $paths = @($app.Cache | Where-Object { $_ -and (Test-Path $_) })
+    if ($paths.Count -gt 0) {
+      $bytes = 0
+      foreach ($d in $paths) { $bytes += Get-FolderSize $d }
+      if ($bytes -gt 1MB) {
+        [void]$rows.Add([pscustomobject]@{
+          App = $app.Name; Action = 'Cache'; Status = (Format-Size $bytes); Target = 'Cleared'
+          Effect = 'Frees disk space. The app rebuilds this cache by itself.'
+          Why = ('Rebuildable cache: {0}' -f ($paths -join ', ')); Data = $paths; Plan = $app; Bytes = $bytes })
+      }
     }
   }
-  $rows
+
+  # 3. the caches that belong to Windows and the graphics stack
+  foreach ($c in Get-SystemCaches) {
+    $paths = @($c.Paths | Where-Object { $_ -and (Test-Path $_) })
+    if ($paths.Count -eq 0) { continue }
+    $bytes = 0
+    foreach ($d in $paths) { $bytes += Get-FolderSize $d }
+    if ($bytes -le 1MB) { continue }
+    [void]$rows.Add([pscustomobject]@{
+      App = $c.Name; Action = 'Cache'; Status = (Format-Size $bytes); Target = 'Cleared'
+      Effect = $c.What; Why = ('Rebuildable cache: {0}' -f ($paths -join ', '))
+      Data = $paths; Plan = $null; Bytes = $bytes; Admin = $c.Admin })
+  }
+
+  # 4. Store apps that can be removed
+  $installed = @{}
+  foreach ($pk in @(Get-AppxPackage -ErrorAction SilentlyContinue)) { $installed[$pk.Name] = $pk }
+  foreach ($a in $RemovableStoreApps) {
+    $pkg = $installed[$a.Id]
+    if (-not $pkg) { continue }
+    [void]$rows.Add([pscustomobject]@{
+      App = $a.Label; Action = 'Uninstall'; Status = 'Installed'; Target = 'Removed'
+      Effect = 'Removes the app for this account. Reinstall it from the Microsoft Store if you want it back.'
+      Why = "Store app $($pkg.Name). This cannot be undone by the Undo log - only by reinstalling."
+      Data = $pkg; Plan = $null; Bytes = 0 })
+  }
+
+  $rows | Sort-Object -Property @{E = { switch ($_.Action) { 'Startup' { 0 } 'Close' { 1 } 'Cache' { 2 } default { 3 } } }},
+                                @{E = 'Bytes'; D = $true}, 'App'
 }
 
 function Invoke-AppAction($Row) {
-  if ($Row.Action -eq 'Startup') {
-    if (-not (Test-Admin) -and $Row.Data.Key -like 'HKLM:*') { throw 'disabling this startup entry needs Administrator' }
-    Add-UndoEntry ([pscustomobject]@{ Type = 'AppStartup'; Key = $Row.Data.Key; Name = $Row.Data.Name; Data = $Row.Data.Data; When = (Get-Date).ToString('s') })
-    Remove-ItemProperty -Path $Row.Data.Key -Name $Row.Data.Name -ErrorAction Stop
-    return
+  switch ($Row.Action) {
+    'Startup' {
+      $e = $Row.Data
+      if ($e.Kind -eq 'Run') {
+        if (-not (Test-Admin) -and $e.Key -like 'HKLM:*') { throw 'this one is machine-wide and needs Administrator' }
+        Add-UndoEntry ([pscustomobject]@{ Type = 'AppStartup'; Key = $e.Key; Name = $e.Name; Data = $e.Data; When = (Get-Date).ToString('s') })
+        Remove-ItemProperty -Path $e.Key -Name $e.Name -ErrorAction Stop
+        return
+      }
+      if ($e.Kind -eq 'File') {
+        if (-not (Test-Path $StartupParked)) { [void](New-Item -ItemType Directory -Path $StartupParked -Force) }
+        $parked = Join-Path $StartupParked (Split-Path $e.Data -Leaf)
+        # the undo entry carries where it came from, so it can be moved back
+        Add-UndoEntry ([pscustomobject]@{ Type = 'StartupFile'; Name = $e.Data; Data = $parked; When = (Get-Date).ToString('s') })
+        Move-Item -Path $e.Data -Destination $parked -Force -ErrorAction Stop
+        return
+      }
+      Add-UndoEntry ([pscustomobject]@{ Type = 'Task'; Name = $e.Name; Data = $e.Key; When = (Get-Date).ToString('s') })
+      Disable-ScheduledTask -TaskName $e.Name -TaskPath $e.Key -ErrorAction Stop | Out-Null
+      return
+    }
+    'Close' {
+      Get-Process -Name $Row.Plan.Process -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Stop
+      return
+    }
+    'Uninstall' {
+      Remove-AppxPackage -Package $Row.Data.PackageFullName -ErrorAction Stop
+      return
+    }
+    default {
+      if ($Row.Admin -and -not (Test-Admin)) { throw 'this cache is machine-wide and needs Administrator' }
+      if ($Row.Plan -and @(Get-Process -Name $Row.Plan.Process -ErrorAction SilentlyContinue).Count -gt 0) {
+        throw "close $($Row.App) before clearing its cache"
+      }
+      foreach ($dir in $Row.Data) {
+        # the folder itself stays: apps expect it to exist
+        Get-ChildItem -Path $dir -Force -ErrorAction SilentlyContinue |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+      }
+      return
+    }
   }
-  if ($Row.Action -eq 'Close') {
-    Get-Process -Name $Row.Plan.Process -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Stop
-    return
-  }
-  if (@(Get-Process -Name $Row.Plan.Process -ErrorAction SilentlyContinue).Count -gt 0) { throw "Close $($Row.App) before clearing its cache" }
-  foreach ($dir in $Row.Data) { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 # --- windows settings --------------------------------------------------------
@@ -1213,10 +1425,48 @@ $GameStoreKey  = 'HKCU:\System\GameConfigStore'
 $GameBarKey    = 'HKCU:\SOFTWARE\Microsoft\GameBar'
 $CaptureKey    = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\graphicsCaptureProgrammatic'
 $CaptureNoBorderKey = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\graphicsCaptureWithoutBorder'
+$LocationKey   = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+$AdvertKey     = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo'
+$PrivacyKey    = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy'
+$InputPersKey  = 'HKCU:\SOFTWARE\Microsoft\InputPersonalization'
+$SpeechKey     = 'HKCU:\SOFTWARE\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy'
+$ActivityKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+$TelemetryKey  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'
+$FeedbackKey   = 'HKCU:\SOFTWARE\Microsoft\Siuf\Rules'
+$ContentKey    = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+$AdvancedKey   = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+$SearchKey     = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings'
+$CopilotKey    = 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot'
+$BackgroundKey = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications'
+$GpuKey        = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'
+$PowerKey      = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
+$MouseKey      = 'HKCU:\Control Panel\Mouse'
+
+# Several of these are one switch in Settings over several values in the
+# registry. Reading the first is enough; writing has to cover them all.
+function Get-GroupState([string]$Path, [string[]]$Names, [int]$Default = 1) {
+  foreach ($n in $Names) {
+    $v = Get-RegValue $Path $n
+    if ($null -ne $v) { return ([int]$v -ne 0) }
+  }
+  return ($Default -ne 0)
+}
+
+function Set-GroupState([string]$Path, [string[]]$Names, [bool]$On) {
+  foreach ($n in $Names) { Set-RegValueLogged $Path $n $(if ($On) { 1 } else { 0 }) 'DWord' }
+}
+
+# pointer acceleration is a system parameter, not just three registry strings
+function Update-MouseSetting([bool]$On) {
+  if (-not ('TsakasNative' -as [type])) { return }
+  $values = $(if ($On) { @(6, 10, 1) } else { @(0, 0, 0) })
+  [void][TsakasNative]::SystemParametersInfoArray(0x0004, 0, $values, 2)   # SPI_SETMOUSE
+}
 
 function Get-WinSettings {
   @(
     [pscustomobject]@{
+      Group = 'Performance'
       Title = 'Delivery Optimization'
       Sub   = 'Uploads Windows updates to other PCs in the background. Off keeps updates coming from Microsoft only.'
       Admin = $true
@@ -1226,6 +1476,7 @@ function Get-WinSettings {
         else     { Set-RegValueLogged $DoPolicyKey 'DODownloadMode' 0 'DWord' } }
     }
     [pscustomobject]@{
+      Group = 'Performance'
       Title = 'Transparency effects'
       Sub   = 'Blur behind Start, the taskbar and menus. Costs a little GPU time every frame.'
       Admin = $false
@@ -1233,6 +1484,7 @@ function Get-WinSettings {
       Write = { param($on) Set-RegValueLogged $PersonalizeKey 'EnableTransparency' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
+      Group = 'Performance'
       Title = 'Animation effects'
       Sub   = 'Window open, close and minimise animations. Off makes the desktop feel more immediate.'
       Admin = $false
@@ -1242,6 +1494,7 @@ function Get-WinSettings {
         Update-AnimationSetting $on }
     }
     [pscustomobject]@{
+      Group = 'Performance'
       Title = 'Game Bar recording'
       Sub   = 'Background recording so Game Bar can save the last few minutes. Off frees CPU and GPU while you play.'
       Admin = $false
@@ -1251,6 +1504,7 @@ function Get-WinSettings {
         Set-RegValueLogged $GameStoreKey 'GameDVR_Enabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
+      Group = 'Performance'
       Title = 'Game Mode'
       Sub   = 'Windows gives the running game priority and holds back background work. Worth leaving on.'
       Admin = $false
@@ -1258,20 +1512,7 @@ function Get-WinSettings {
       Write = { param($on) Set-RegValueLogged $GameBarKey 'AutoGameModeEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
-      Title = 'Screenshots and screen recording'
-      Sub   = 'Allow apps to take screenshots and record your screen. Desktop tools like OBS, ShareX and Snipping Tool are not affected.'
-      Admin = $false
-      Read  = { $v = Get-RegValue $CaptureKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
-      Write = { param($on) Set-RegValueLogged $CaptureKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
-    }
-    [pscustomobject]@{
-      Title = 'Screenshot borders'
-      Sub   = 'Allow apps to take a screenshot of one window without its border.'
-      Admin = $false
-      Read  = { $v = Get-RegValue $CaptureNoBorderKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
-      Write = { param($on) Set-RegValueLogged $CaptureNoBorderKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
-    }
-    [pscustomobject]@{
+      Group = 'Performance'
       Title = 'Offline maps'
       Sub   = 'Downloads and updates map data for the Maps app. Manual unless you actually use offline maps.'
       Admin = $true
@@ -1286,6 +1527,188 @@ function Get-WinSettings {
           Set-Service -Name MapsBroker -StartupType Manual -ErrorAction Stop
           Stop-Service -Name MapsBroker -Force -ErrorAction SilentlyContinue
         } }
+    }
+    [pscustomobject]@{
+      Group = 'Performance'
+      Title = 'Background apps'
+      Sub   = 'Lets Store apps keep running when you are not using them. Off stops them waking up on their own.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $BackgroundKey 'GlobalUserDisabled'; return ($null -eq $v -or [int]$v -eq 0) }
+      Write = { param($on) Set-RegValueLogged $BackgroundKey 'GlobalUserDisabled' $(if ($on) { 0 } else { 1 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Performance'
+      Title = 'Hardware-accelerated GPU scheduling'
+      Sub   = 'The GPU manages its own work queue instead of the CPU. Helps frame pacing and latency. Needs a restart.'
+      Admin = $true
+      Read  = { $v = Get-RegValue $GpuKey 'HwSchMode'; return ($null -eq $v -or [int]$v -ne 1) }
+      Write = { param($on) Set-RegValueLogged $GpuKey 'HwSchMode' $(if ($on) { 2 } else { 1 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Performance'
+      Title = 'Fast startup'
+      Sub   = 'Shutdown saves part of the session instead of closing fully. Off fixes drivers and USB devices behaving oddly after a shutdown.'
+      Admin = $true
+      Read  = { $v = Get-RegValue $PowerKey 'HiberbootEnabled'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on) Set-RegValueLogged $PowerKey 'HiberbootEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Performance'
+      Title = 'Enhance pointer precision'
+      Sub   = 'Mouse acceleration: the pointer moves further when you move the mouse faster. Most players want this off.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $MouseKey 'MouseSpeed'; return ($null -eq $v -or "$v" -ne '0') }
+      Write = { param($on)
+        Set-RegValueLogged $MouseKey 'MouseSpeed' $(if ($on) { '1' } else { '0' }) 'String'
+        Set-RegValueLogged $MouseKey 'MouseThreshold1' $(if ($on) { '6' } else { '0' }) 'String'
+        Set-RegValueLogged $MouseKey 'MouseThreshold2' $(if ($on) { '10' } else { '0' }) 'String'
+        Update-MouseSetting $on }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Screenshots and screen recording'
+      Sub   = 'Allow apps to take screenshots and record your screen. Desktop tools like OBS, ShareX and Snipping Tool are not affected.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $CaptureKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
+      Write = { param($on) Set-RegValueLogged $CaptureKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Screenshot borders'
+      Sub   = 'Allow apps to take a screenshot of one window without its border.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $CaptureNoBorderKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
+      Write = { param($on) Set-RegValueLogged $CaptureNoBorderKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Advertising ID'
+      Sub   = 'Lets apps tie the ads they show you to one ID for this account.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $AdvertKey 'Enabled'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on) Set-RegValueLogged $AdvertKey 'Enabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Tailored experiences'
+      Sub   = 'Lets Microsoft use your diagnostic data to pick tips, ads and recommendations for you.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $PrivacyKey 'TailoredExperiencesWithDiagnosticDataEnabled'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on) Set-RegValueLogged $PrivacyKey 'TailoredExperiencesWithDiagnosticDataEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Diagnostic data'
+      Sub   = 'Optional diagnostic data sent to Microsoft. Off leaves only the required minimum, which cannot be turned off on Home.'
+      Admin = $true
+      Read  = { $v = Get-RegValue $TelemetryKey 'AllowTelemetry'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on)
+        if ($on) { Remove-RegValueLogged $TelemetryKey 'AllowTelemetry' 'DWord' }
+        else     { Set-RegValueLogged $TelemetryKey 'AllowTelemetry' 0 'DWord' } }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Activity history'
+      Sub   = 'Windows keeps a list of what you opened and sends it to your Microsoft account.'
+      Admin = $true
+      Read  = { $v = Get-RegValue $ActivityKey 'PublishUserActivities'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on)
+        if ($on) { Remove-RegValueLogged $ActivityKey 'PublishUserActivities' 'DWord' }
+        else     { Set-RegValueLogged $ActivityKey 'PublishUserActivities' 0 'DWord' } }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Inking and typing personalisation'
+      Sub   = 'Builds a custom dictionary from what you type and write. Off also stops it collecting contact names.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $InputPersKey 'RestrictImplicitTextCollection'; return ($null -eq $v -or [int]$v -eq 0) }
+      Write = { param($on)
+        $block = $(if ($on) { 0 } else { 1 })
+        Set-RegValueLogged $InputPersKey 'RestrictImplicitTextCollection' $block 'DWord'
+        Set-RegValueLogged $InputPersKey 'RestrictImplicitInkCollection' $block 'DWord'
+        Set-RegValueLogged "$InputPersKey\TrainedDataStore" 'HarvestContacts' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Online speech recognition'
+      Sub   = 'Sends your voice to Microsoft for dictation and voice apps. Windows Speech Recognition still works offline.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $SpeechKey 'HasAccepted'; return ($null -ne $v -and [int]$v -ne 0) }
+      Write = { param($on) Set-RegValueLogged $SpeechKey 'HasAccepted' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Location'
+      Sub   = 'Allow apps to see where this PC is. Weather and Maps use it; most other apps do not need it.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $LocationKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
+      Write = { param($on) Set-RegValueLogged $LocationKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
+    }
+    [pscustomobject]@{
+      Group = 'Privacy'
+      Title = 'Feedback requests'
+      Sub   = 'Windows asking how you are getting on with it.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $FeedbackKey 'NumberOfSIUFInPeriod'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on)
+        if ($on) { Remove-RegValueLogged $FeedbackKey 'NumberOfSIUFInPeriod' 'DWord' }
+        else     { Set-RegValueLogged $FeedbackKey 'NumberOfSIUFInPeriod' 0 'DWord' } }
+    }
+    [pscustomobject]@{
+      Group = 'Suggestions and ads'
+      Title = 'Tips and suggestions'
+      Sub   = 'Notifications suggesting features, and the welcome tour after an update.'
+      Admin = $false
+      Read  = { Get-GroupState $ContentKey @('SubscribedContent-338389Enabled', 'SoftLandingEnabled') }
+      Write = { param($on) Set-GroupState $ContentKey @('SubscribedContent-338389Enabled', 'SoftLandingEnabled') $on }
+    }
+    [pscustomobject]@{
+      Group = 'Suggestions and ads'
+      Title = 'Start menu and Settings suggestions'
+      Sub   = 'Recommended apps in Start and the suggestion cards inside the Settings app.'
+      Admin = $false
+      Read  = { Get-GroupState $ContentKey @('SubscribedContent-338388Enabled', 'SubscribedContent-338393Enabled', 'SubscribedContent-353694Enabled', 'SubscribedContent-353696Enabled') }
+      Write = { param($on) Set-GroupState $ContentKey @('SubscribedContent-338388Enabled', 'SubscribedContent-338393Enabled', 'SubscribedContent-353694Enabled', 'SubscribedContent-353696Enabled') $on }
+    }
+    [pscustomobject]@{
+      Group = 'Suggestions and ads'
+      Title = 'Automatically installed apps'
+      Sub   = 'Windows quietly installing promoted apps and games into your Start menu.'
+      Admin = $false
+      Read  = { Get-GroupState $ContentKey @('SilentInstalledAppsEnabled', 'PreInstalledAppsEnabled', 'OemPreInstalledAppsEnabled') }
+      Write = { param($on) Set-GroupState $ContentKey @('SilentInstalledAppsEnabled', 'PreInstalledAppsEnabled', 'OemPreInstalledAppsEnabled') $on }
+    }
+    [pscustomobject]@{
+      Group = 'Suggestions and ads'
+      Title = 'Explorer sync notifications'
+      Sub   = 'The OneDrive and Office adverts that appear as notifications inside File Explorer.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $AdvancedKey 'ShowSyncProviderNotifications'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on) Set-RegValueLogged $AdvancedKey 'ShowSyncProviderNotifications' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Suggestions and ads'
+      Title = 'Search highlights and web results'
+      Sub   = 'The rotating artwork in the search box and the cloud content it searches. Local search is untouched.'
+      Admin = $false
+      Read  = { Get-GroupState $SearchKey @('IsDynamicSearchBoxEnabled', 'IsMSACloudSearchEnabled', 'IsAADCloudSearchEnabled') }
+      Write = { param($on) Set-GroupState $SearchKey @('IsDynamicSearchBoxEnabled', 'IsMSACloudSearchEnabled', 'IsAADCloudSearchEnabled') $on }
+    }
+    [pscustomobject]@{
+      Group = 'Suggestions and ads'
+      Title = 'Widgets'
+      Sub   = 'The news and weather panel on the taskbar, and the background process behind it.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $AdvancedKey 'TaskbarDa'; return ($null -eq $v -or [int]$v -ne 0) }
+      Write = { param($on) Set-RegValueLogged $AdvancedKey 'TaskbarDa' $(if ($on) { 1 } else { 0 }) 'DWord' }
+    }
+    [pscustomobject]@{
+      Group = 'Suggestions and ads'
+      Title = 'Copilot'
+      Sub   = 'The Copilot button and its background process. Nothing else on the taskbar changes.'
+      Admin = $false
+      Read  = { $v = Get-RegValue $CopilotKey 'TurnOffWindowsCopilot'; return ($null -eq $v -or [int]$v -eq 0) }
+      Write = { param($on) Set-RegValueLogged $CopilotKey 'TurnOffWindowsCopilot' $(if ($on) { 0 } else { 1 }) 'DWord' }
     }
   )
 }
@@ -1783,7 +2206,7 @@ function Show-Gui {
     @{ Title = 'Memory';                 Sub = 'Whether EXPO is really on, and whether the sticks are in the right slots' }
     @{ Title = 'Motherboard';            Sub = 'How old the BIOS is, and which drivers Windows is guessing at' }
     @{ Title = 'Network';                Sub = 'Adapter power saving that quietly costs you latency' }
-    @{ Title = 'App Optimizer';          Sub = 'Real startup, memory and disk actions for Discord and Spotify' }
+    @{ Title = 'App Optimizer';          Sub = 'Everything that starts with Windows, the caches worth clearing, and Store apps you can remove' }
     @{ Title = 'Windows Settings';       Sub = 'The Windows features that quietly cost you performance, as switches' }
   )
 
@@ -2364,7 +2787,7 @@ function Show-Gui {
   $alv.Location = New-Object Drawing.Point(12, 12)
   $alv.Size = New-Object Drawing.Size($ctlW, 260)
   $alv.Anchor = 'Top,Left,Right'
-  foreach ($c in @(@('App', 100), @('Action', 100), @('Current state', 180), @('Result', 120), @('What it does', 300))) {
+  foreach ($c in @(@('App', 240), @('Action', 90), @('Current state', 190), @('Result', 100), @('What it does', 300))) {
     [void]$alv.Columns.Add($c[0], $c[1])
   }
   $tab5.Controls.Add($alv)
@@ -2387,7 +2810,8 @@ function Show-Gui {
 
   $loadApps = {
     $alv.Items.Clear()
-    foreach ($r in @(Get-AppFindings)) {
+    $rows = @(Get-AppFindings)
+    foreach ($r in $rows) {
       $it = New-Object Windows.Forms.ListViewItem($r.App)
       [void]$it.SubItems.Add($r.Action)
       [void]$it.SubItems.Add($r.Status)
@@ -2398,9 +2822,14 @@ function Show-Gui {
     }
     if ($fitList) { & $fitList $alv $atextCard 0.45 }
     if ($alv.Items.Count -eq 0) {
-      $atext.Text = 'Discord and Spotify have no startup, running-process, or rebuildable-cache actions to offer right now.'
+      $atext.Text = 'Nothing to offer: no startup entries, no cache worth clearing, no removable Store apps.'
     } else {
-      $atext.Text = 'Select a row to see why it is listed. Cache cleanup frees disk space; it is not a permanent speed boost.'
+      $reclaim = ($rows | Measure-Object Bytes -Sum).Sum
+      $atext.Text = "{0} startup entr(ies), {1} cache(s) holding {2}, {3} Store app(s) that can be removed.`r`n`r`nSelect a row to see what it is. Clearing a cache frees disk space; it is not a permanent speed boost." -f `
+        @($rows | Where-Object { $_.Action -eq 'Startup' }).Count,
+        @($rows | Where-Object { $_.Action -eq 'Cache' }).Count,
+        (Format-Size $reclaim),
+        @($rows | Where-Object { $_.Action -eq 'Uninstall' }).Count
     }
   }
 
@@ -2418,7 +2847,12 @@ function Show-Gui {
       return
     }
     $names = ($items | ForEach-Object { "$($_.Tag.App): $($_.Tag.Action)" }) -join "`r`n"
-    $ans = & $dialog "Apply these changes?`r`n`r`n$names" 'TsakasOptimizer' 'YesNo'
+    $gone = @($items | Where-Object { $_.Tag.Action -eq 'Uninstall' })
+    $warn = $(if ($gone.Count) {
+      "`r`n`r`nWARNING: {0} of these are uninstalls ({1}). Removing an app cannot be undone by this tool - you would have to reinstall it from the Microsoft Store." -f `
+        $gone.Count, (($gone | ForEach-Object { $_.Tag.App }) -join ', ')
+    } else { '' })
+    $ans = & $dialog "Apply these changes?`r`n`r`n$names$warn" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
     $done = 0; $errs = @()
     foreach ($it in $items) {
@@ -2474,9 +2908,22 @@ function Show-Gui {
 
   $toggles = @()
   $settings = @(Get-WinSettings)
+  $rowY = 0
+  $lastGroup = ''
   for ($i = 0; $i -lt $settings.Count; $i++) {
+    if ($settings[$i].Group -ne $lastGroup) {
+      $lastGroup = $settings[$i].Group
+      $groupLabel = New-Object Windows.Forms.Label
+      $groupLabel.Text = $lastGroup
+      $groupLabel.Font = New-Object Drawing.Font($semi, 10)
+      $groupLabel.ForeColor = $muted
+      $groupLabel.AutoSize = $true
+      $groupLabel.Location = New-Object Drawing.Point(4, ($rowY + $(if ($i -eq 0) { 0 } else { 14 })))
+      $setList.Controls.Add($groupLabel)
+      $rowY = $groupLabel.Bottom + 8
+    }
     $row = New-Object Windows.Forms.Panel
-    $row.Location = New-Object Drawing.Point(0, ($i * 78))
+    $row.Location = New-Object Drawing.Point(0, $rowY)
     $row.Size = New-Object Drawing.Size(($ctlW - 20), 70)
     $row.Anchor = 'Top,Left,Right'
     $row.BackColor = $card
@@ -2521,6 +2968,7 @@ function Show-Gui {
     $tog.Add_LostFocus({ param($s, $e) $s.Invalidate() })
     $row.Controls.Add($tog)
     $toggles += $tog
+    $rowY = $row.Bottom + 8
   }
 
   $setStatus.Location = New-Object Drawing.Point(12, $btnRowY)
@@ -2699,6 +3147,8 @@ public static class TsakasNative {
   public static extern bool ShowScrollBar(IntPtr hWnd, int bar, bool show);
   [DllImport("user32.dll", SetLastError = true)]
   public static extern bool SystemParametersInfo(uint action, uint param, IntPtr vparam, uint winIni);
+  [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")]
+  public static extern bool SystemParametersInfoArray(uint action, uint param, int[] vparam, uint winIni);
 }
 '@
     }
@@ -2842,6 +3292,24 @@ function Invoke-SelfTest {
     @{N = 'autostart name prefix match works';    R = (Test-AutoStarts 'Overwolf' (New-Object System.Collections.Generic.HashSet[string] ([string[]]@('OverwolfLauncher'), [StringComparer]::OrdinalIgnoreCase)))}
     @{N = 'App Optimizer includes Discord';       R = ((@(Get-AppPlans | Where-Object Name -eq 'Discord')).Count -eq 1)}
     @{N = 'App Optimizer includes Spotify';       R = ((@(Get-AppPlans | Where-Object Name -eq 'Spotify')).Count -eq 1)}
+    @{N = 'app plans do not repeat a name';       R = (@(Get-AppPlans | Group-Object Name | Where-Object { $_.Count -gt 1 }).Count -eq 0)}
+    @{N = 'store list has no duplicates';         R = (@($RemovableStoreApps | Group-Object { $_.Id } | Where-Object { $_.Count -gt 1 }).Count -eq 0)}
+    @{N = 'the Store itself is never offered';    R = (@($RemovableStoreApps | Where-Object { $_.Id -match 'WindowsStore|SecHealth|VCLibs|\.NET|Runtime' }).Count -eq 0)}
+    @{N = 'startup entries carry a kind and name'; R = (& {
+        $e = @(Get-AppStartupEntries)
+        ($e.Count -eq 0) -or (@($e | Where-Object { $_.Kind -and $_.Name -and $_.Where }).Count -eq $e.Count) })}
+    @{N = 'sizes read in human units';            R = ((Format-Size 0) -eq '0' -and (Format-Size 2048) -eq '2 KB' -and (Format-Size 5MB) -eq '5 MB' -and (Format-Size 3GB) -match '^3[.,]0 GB$')}
+    @{N = 'a folder size adds its files up';      R = (& {
+        $d = Join-Path $env:TEMP ("size-" + [guid]::NewGuid().ToString('N'))
+        try {
+          [void](New-Item -ItemType Directory -Path $d -Force)
+          [void](New-Item -ItemType Directory -Path (Join-Path $d 'inner') -Force)
+          Set-Content -Path (Join-Path $d 'a.bin') -Value ('x' * 1000) -NoNewline
+          Set-Content -Path (Join-Path $d 'inner\b.bin') -Value ('x' * 500) -NoNewline
+          # measured, not assumed: the encoding decides the byte count, the walk decides the total
+          $expected = (Get-ChildItem $d -Recurse -File | Measure-Object Length -Sum).Sum
+          ((Get-FolderSize $d) -eq $expected) -and ($expected -gt 1000)
+        } finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } })}
     @{N = 'app scan runs without error';          R = ((@(Get-AppFindings)).Count -ge 0)}
     # network tab
     @{N = 'enabled green ethernet is flagged';    R = ((Get-NetOffValue 'Green Ethernet' 'Enabled' @('Disabled','Enabled')) -eq 'Disabled')}
@@ -2903,7 +3371,16 @@ function Invoke-SelfTest {
     # windows settings
     @{N = 'every switch has a title and a read'; R = (@(Get-WinSettings | Where-Object { $_.Title -and $_.Sub -and $_.Read -and $_.Write }).Count -eq @(Get-WinSettings).Count)}
     @{N = 'every switch reads a true/false';     R = (@(Get-WinSettings | Where-Object { (& $_.Read) -is [bool] }).Count -eq @(Get-WinSettings).Count)}
-    @{N = 'only machine-wide ones need admin';   R = (@(Get-WinSettings | Where-Object { $_.Admin }).Count -eq 2)}
+    @{N = 'every switch is in a group';          R = (@(Get-WinSettings | Where-Object { $_.Group }).Count -eq @(Get-WinSettings).Count)}
+    @{N = 'switch titles do not repeat';         R = (@(Get-WinSettings | Group-Object Title | Where-Object { $_.Count -gt 1 }).Count -eq 0)}
+    @{N = 'a grouped value reads its first key'; R = (& {
+        $key = 'HKCU:\Software\TsakasOptimizerSelfTest2'
+        try {
+          [void](New-Item -Path $key -Force)
+          New-ItemProperty -Path $key -Name 'B' -Value 0 -PropertyType DWord -Force | Out-Null
+          ((Get-GroupState $key @('A', 'B')) -eq $false) -and ((Get-GroupState $key @('A', 'C')) -eq $true)
+        } finally { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue }
+      })}
     @{N = 'a registry write can be undone';      R = (& {
         $key = 'HKCU:\Software\TsakasOptimizerSelfTest'
         $log = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
@@ -2948,6 +3425,17 @@ function Invoke-SelfTest {
 }
 
 # --- main --------------------------------------------------------------------
+# Service start types, machine-wide policies and the Windows caches all need
+# Administrator, so ask for it up front instead of failing halfway through. A
+# refused prompt still opens the app; it just skips what it cannot do.
+if (-not ($SelfTest -or $Undo -or $Console -or $Report) -and -not (Test-Admin) -and $PSCommandPath) {
+  try {
+    Start-Process powershell -Verb RunAs -ArgumentList @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $PSCommandPath) -ErrorAction Stop
+    return
+  } catch { }   # cancelled at the prompt: carry on without it
+}
+
 if ($SelfTest) { Invoke-SelfTest; return }
 if ($Undo)     { Invoke-Undo;     return }
 if (-not $Console -and -not $Report) { Show-Gui; return }

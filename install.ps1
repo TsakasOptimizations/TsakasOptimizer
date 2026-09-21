@@ -47,6 +47,14 @@ foreach ($lnk in $links) {
   $s.Description      = 'Find background apps and services worth closing'
   if ($Icon -and (Test-Path $Icon)) { $s.IconLocation = $Icon }
   $s.Save()
+
+  # "run as administrator" lives in a flag byte of the shortcut header, which
+  # WScript.Shell cannot set
+  try {
+    $bytes = [IO.File]::ReadAllBytes($lnk)
+    $bytes[0x15] = $bytes[0x15] -bor 0x20
+    [IO.File]::WriteAllBytes($lnk, $bytes)
+  } catch { }
 }
 
 Write-Host "  Installed version $version to $Dir" -ForegroundColor Green
