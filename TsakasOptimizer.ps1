@@ -24,7 +24,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.2'
+$Version = '13.1.3'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -2181,11 +2181,13 @@ function Show-Gui {
   $lv.Tag = 0                       # the name column is the one that stretches
   $lv.ShowGroups = $true
   # one argument, because the two-argument form takes a key first, not the header
-  $grpPicks    = New-Object Windows.Forms.ListViewGroup('Worth a look')
+  $grpProcPick = New-Object Windows.Forms.ListViewGroup('Suggested processes')
+  $grpSvcPick  = New-Object Windows.Forms.ListViewGroup('Suggested services')
   $grpProcs    = New-Object Windows.Forms.ListViewGroup('Processes')
   $grpServices = New-Object Windows.Forms.ListViewGroup('Services')
   $grpDisabled = New-Object Windows.Forms.ListViewGroup('Disabled services')
-  foreach ($grp in @($grpPicks, $grpProcs, $grpServices, $grpDisabled)) { [void]$lv.Groups.Add($grp) }
+  $groups = @($grpProcPick, $grpSvcPick, $grpProcs, $grpServices, $grpDisabled)
+  foreach ($grp in $groups) { [void]$lv.Groups.Add($grp) }
   $tab1.Controls.Add($lv)
 
   $details = New-Object Windows.Forms.TextBox
@@ -2275,14 +2277,14 @@ function Show-Gui {
       [void]$it.SubItems.Add($f.Type)
       [void]$it.SubItems.Add($(if ($f.RamMB -gt 0) { '{0} MB' -f $f.RamMB } else { '-' }))
       $it.Group = $(
-        if ($f.Confidence -ne 'Leave') { $grpPicks }
+        if ($f.Confidence -ne 'Leave') { $(if ($f.Type -eq 'Process') { $grpProcPick } else { $grpSvcPick }) }
         elseif ($f.Type -eq 'Process') { $grpProcs }
         elseif ($f.Mode -eq 'Disabled') { $grpDisabled }
         else { $grpServices })
       $it.Tag = $f
       [void]$lv.Items.Add($it)
     }
-    foreach ($grp in @($grpPicks, $grpProcs, $grpServices, $grpDisabled)) {
+    foreach ($grp in $groups) {
       $grp.Header = "{0} ({1})" -f ($grp.Header -replace ' \(\d+\)$', ''), $grp.Items.Count
     }
     $lv.EndUpdate()
@@ -2291,8 +2293,9 @@ function Show-Gui {
     $svcRows  = @($rows | Where-Object { $_.Type -eq 'Service' })
     $running  = ($procRows | Measure-Object Count -Sum).Sum
     $autoSvc  = @($svcRows | Where-Object { $_.Mode -eq 'Auto' }).Count
-    $todo     = @($rows | Where-Object { $_.Action -ne 'None' }).Count
-    $summary.Text = "{0} processes running in {1} apps   {2} services, {3} start with Windows   {4} worth a look" -f `
+    # what the scan picked, not what can be ticked - everything can be ticked
+    $todo     = @($rows | Where-Object { $_.Confidence -ne 'Leave' }).Count
+    $summary.Text = "{0} processes running in {1} apps   {2} services, {3} start with Windows   {4} suggested" -f `
       $running, $procRows.Count, $svcRows.Count, $autoSvc, $todo
     $status.Text = $(if (Test-Admin) { 'Tick what you want changed, then press Apply.' }
                      else { 'Not running as administrator - service changes will be skipped.' })
@@ -2876,7 +2879,7 @@ function Show-Gui {
 
   # ---- every list and text pane becomes a rounded white card ----
   $rowHeight = New-Object Windows.Forms.ImageList
-  $rowHeight.ImageSize = New-Object Drawing.Size(1, (& $sc 28))
+  $rowHeight.ImageSize = New-Object Drawing.Size(1, (& $sc 32))
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
     $l.SmallImageList = $rowHeight
     $l.BorderStyle = 'None'
@@ -2917,14 +2920,14 @@ function Show-Gui {
   # the native checkbox stays white on a dark row; a state image list replaces
   # both glyphs, which is the only hook WinForms gives for them
   $checkImages = New-Object Windows.Forms.ImageList
-  $cbSize = & $sc 16
+  $cbSize = & $sc 19
   $checkImages.ImageSize = New-Object Drawing.Size($cbSize, $cbSize)
   $checkImages.ColorDepth = 'Depth32Bit'
   foreach ($on in @($false, $true)) {
     $bmp = New-Object Drawing.Bitmap($cbSize, $cbSize)
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = 'AntiAlias'
-    $g.ScaleTransform($dpiScale, $dpiScale)
+    $g.ScaleTransform(($dpiScale * 19 / 16), ($dpiScale * 19 / 16))
     if ($on) {
       $b = New-Object Drawing.SolidBrush($accentFill)
       $g.FillRectangle($b, 2, 2, 12, 12)

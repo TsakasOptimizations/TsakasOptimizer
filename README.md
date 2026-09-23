@@ -44,8 +44,8 @@ Remove-Item "$env:LOCALAPPDATA\TsakasOptimizer" -Recurse -Force
 Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\TsakasOptimizer.lnk", "$env:USERPROFILE\Desktop\TsakasOptimizer.lnk" -Force
 ```
 
-Services you set to Manual stay that way - press Undo in the app before removing
-it if you want them back on Automatic.
+Anything you changed stays changed after uninstalling. Set services back in
+`services.msc` and settings back in the Settings app if you want them.
 
 ## What it looks at
 
@@ -55,18 +55,28 @@ it if you want them back on Automatic.
    peripheral suites) with specific advice for each.
 2. Anything the catalog has never heard of is scored on behaviour instead:
    does it start itself with Windows, does it have a window open, does its name
-   look like a helper or updater, how much memory it holds. Only things that
-   score high enough are listed, and the reasons are shown.
+   look like a helper or updater, how much memory it holds. Things that score
+   high enough go under *Suggested processes* or *Suggested services*, with
+   the reasons shown.
 
-Nothing is ticked for you. Processes are closed; services are set to Manual,
-which is reversible with the Undo button.
+Every process and service is listed underneath, grouped, with a live count at
+the top and an information mark on each row that looks it up. Nothing is ticked
+for you. Processes are closed; a service steps down one notch - Automatic to
+Manual, Manual to Disabled. Windows' own processes and services can be ticked
+too, but the confirmation names them and says what can break.
 
-**App Optimizer tab.** Discord and Spotify only. It can disable their Windows
-startup entry, close their running processes, and remove rebuildable cache
-folders. Startup changes are reversible with Undo; closing frees current RAM
-and CPU until the app is opened again; cache cleanup frees disk space but is
-not a permanent performance boost. It does not change app settings, updates,
-audio quality, or network behaviour.
+**App Optimizer tab.** Everything that starts with Windows - Run keys, the
+Startup folders and logon scheduled tasks - with a switch to stop each one.
+Startup-folder shortcuts are moved to `startup-disabled` rather than deleted.
+It also sizes the caches worth clearing (Delivery Optimization, Windows Update,
+NVIDIA, DirectX and Steam shader caches, temp files, crash dumps, and around
+twenty apps' own caches) and offers a short, curated list of Store apps to
+remove. Removing a Store app has no way back except reinstalling it.
+
+**Windows Settings tab.** Switches for performance, privacy and the suggestions
+Windows shows you - Game Bar recording, GPU scheduling, fast startup, pointer
+acceleration, advertising ID, diagnostic data, activity history, Start menu
+suggestions, widgets, Copilot and more. Each applies the moment it is flipped.
 
 Never suggested: Windows components, anything under `C:\Windows`, anything whose
 executable cannot be read, and anything that looks like antivirus, firewall,
@@ -79,7 +89,7 @@ for the detected platform. Read-only - it never touches the BIOS.
 Windows does not expose live memory timings, so the timings shown come from the
 SPD/rated profile. Verify the loaded values in BIOS, ZenTimings or CPU-Z.
 
-**Network tab.** Three groups, each change undoable:
+**Network tab.** Three groups:
 
 - *Power saving* - Energy-Efficient Ethernet, Green Ethernet, adapter power
   saving and "allow the computer to turn off this device". Worth turning off on
@@ -99,10 +109,7 @@ right cores depend on the CPU.
 
 | Switch | What it does |
 |---|---|
-| *(none)* | Opens the window |
-| `-Console` | Text mode, asks y/n per item |
-| `-Report` | Lists findings, changes nothing |
-| `-Undo` | Restores service start types this tool changed |
+| *(none)* | Opens the window, asking for Administrator first |
 | `-SelfTest` | Runs the built-in checks |
 
 ## Updates
