@@ -4,12 +4,12 @@
   commonly safe to close or switch to Manual, and asks before touching anything.
   #>
 [CmdletBinding()]
-param([switch]$Console, [switch]$Report, [switch]$Undo, [switch]$SelfTest)
+param([switch]$SelfTest)
 
 # PowerShell always gets a console and is DPI-unaware. The GUI wants neither: a
 # hidden console whichever way the script was started, and real pixels instead of
 # a window Windows stretches (and blurs) on a 125% or 150% display.
-if (-not ($Console -or $Report -or $Undo -or $SelfTest)) {
+if (-not $SelfTest) {
   try {
     Add-Type -Name Startup -Namespace Tsakas -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
@@ -24,13 +24,13 @@ if (-not ($Console -or $Report -or $Undo -or $SelfTest)) {
   } catch { }
 }
 
-$Version = '1.13.1'
+$Version = '13.1.2'
+$Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
 $RawUrl  = "https://raw.githubusercontent.com/$Repo/$Branch/TsakasOptimizer.ps1"
 
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $env:LOCALAPPDATA 'TsakasOptimizer' }
-$UndoFile = Join-Path $Root 'optimizer-undo.json'
 
 # --- updates -----------------------------------------------------------------
 # The published script is the manifest: read its $Version line.
@@ -309,28 +309,14 @@ $BloatWords = 'updat|upgrad|telemetr|helper|agent|crash|report|tray|notif|daemon
 # never scored - too risky to disable on a heuristic
 $NeverGuess = 'defender|antivir|antimalware|security|firewall|vpn|backup|bitlocker|encrypt|audio|realtek|nvidia|amd |intel\(r\)|driver|bluetooth|network|storage|raid|nvme|hyper-v|vmware|virtualbox|wsl'
 
+# names of everything that starts with Windows, for the scoring. The entries
+# themselves come from the same reader the App Optimizer uses.
 function Get-AutoStartNames {
-  # Get-ScheduledTask costs ~0.7s; startup entries cannot change mid-run, so read once.
   if ($script:AutoNames) { return $script:AutoNames }
   $set = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
-  $add = { param($text) foreach ($m in [regex]::Matches([string]$text, '([^\\/":\s]+)\.exe')) { [void]$set.Add($m.Groups[1].Value) } }
-
-  foreach ($k in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
-                   'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
-                   'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run')) {
-    if (-not (Test-Path $k)) { continue }
-    $item = Get-Item $k
-    foreach ($n in $item.GetValueNames()) { & $add $item.GetValue($n) }
-  }
-  foreach ($d in @([Environment]::GetFolderPath('Startup'), [Environment]::GetFolderPath('CommonStartup'))) {
-    foreach ($f in (Get-ChildItem $d -File -ErrorAction SilentlyContinue)) { [void]$set.Add($f.BaseName) }
-  }
-  # tasks that run at logon or boot
-  foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue)) {
-    $trig = $t.Triggers.CimClass.CimClassName
-    if ($trig -notcontains 'MSFT_TaskLogonTrigger' -and $trig -notcontains 'MSFT_TaskBootTrigger') { continue }
-    [void]$set.Add(($t.TaskName -replace '\s.*$', ''))
-    foreach ($a in $t.Actions) { & $add $a.Execute }
+  foreach ($e in @(Get-AppStartupEntries)) {
+    [void]$set.Add(($e.Name -replace '\s.*$', ''))
+    foreach ($m in [regex]::Matches([string]$e.Data, '([^\\/":\s]+)\.exe')) { [void]$set.Add($m.Groups[1].Value) }
   }
   $script:AutoNames = $set
   $set
@@ -409,90 +395,10 @@ function Test-Admin {
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# Flattens whatever shape the file is in: a bare object, a proper array, or the
-# nested { value = (...); Count = n } wrappers older builds wrote.
-function Expand-UndoEntries($Node, $Sink) {
-  if ($null -eq $Node) { return }
-  if ($Node -is [System.Collections.IEnumerable] -and $Node -isnot [string]) {
-    foreach ($item in $Node) { Expand-UndoEntries $item $Sink }
-    return
-  }
-  $names = @($Node.PSObject.Properties.Name)
-  if ($names -contains 'Type') { [void]$Sink.Add($Node); return }
-  if ($names -contains 'value') { Expand-UndoEntries $Node.value $Sink }
-}
-
-function Read-UndoLog([string]$Path = $UndoFile) {
-  $entries = New-Object System.Collections.ArrayList
-  if (-not (Test-Path $Path)) { return @() }
-  $raw = (Get-Content $Path -Raw)
-  if (-not $raw -or -not $raw.Trim()) { return @() }
-  try { Expand-UndoEntries ($raw | ConvertFrom-Json) $entries } catch { }
-  return @($entries)
-}
-
-function Add-UndoEntry($Entry, [string]$Path = $UndoFile) {
-  $dir = Split-Path $Path
-  if ($dir -and -not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
-  $log = New-Object System.Collections.ArrayList
-  foreach ($e in (Read-UndoLog $Path)) { [void]$log.Add($e) }
-  [void]$log.Add($Entry)
-  # -InputObject, because piping an array here is what nested the log in the first place
-  ConvertTo-Json -InputObject @($log) -Depth 5 | Out-File $Path -Encoding utf8
-}
-
-function Invoke-Undo {
-  if (-not (Test-Path $UndoFile)) { Write-Host 'Nothing to undo.'; return }
-  if (-not (Test-Admin)) { Write-Host 'Run as Administrator to restore services.' -ForegroundColor Yellow; return }
-  $failed = New-Object System.Collections.ArrayList
-  foreach ($e in (Read-UndoLog)) {
-    try {
-      switch ($e.Type) {
-        'AppStartup' {
-          New-ItemProperty -Path $e.Key -Name $e.Name -Value $e.Data -PropertyType String -Force | Out-Null
-        }
-        'NetProperty' {
-          Set-NetAdapterAdvancedProperty -Name $e.Adapter -DisplayName $e.Name -DisplayValue $e.Previous -ErrorAction Stop
-        }
-        'StartupFile' {
-          Move-Item -Path $e.Data -Destination $e.Name -Force -ErrorAction Stop
-        }
-        'Task' {
-          Enable-ScheduledTask -TaskName $e.Name -TaskPath $e.Data -ErrorAction Stop | Out-Null
-        }
-        'RegValue' {
-          if ($e.Existed) {
-            if (-not (Test-Path $e.Path)) { [void](New-Item -Path $e.Path -Force) }
-            New-ItemProperty -Path $e.Path -Name $e.Name -Value $e.Previous -PropertyType $e.Kind -Force | Out-Null
-          } else {
-            Remove-ItemProperty -Path $e.Path -Name $e.Name -ErrorAction SilentlyContinue
-          }
-        }
-        'TcpipReg' {
-          New-ItemProperty -Path $TcpipKey -Name $e.Name -Value ([int]$e.Previous) -PropertyType DWord -Force | Out-Null
-        }
-        'NetPower' {
-          $pm = Get-NetAdapterPowerManagement -Name $e.Adapter -ErrorAction Stop
-          $pm.AllowComputerToTurnOffDevice = $e.Previous
-          Set-NetAdapterPowerManagement -InputObject $pm -ErrorAction Stop
-        }
-        default { Set-Service -Name $e.Name -StartupType $e.Previous }
-      }
-      Write-Host ("restored {0} -> {1}" -f $e.Name, $e.Previous) -ForegroundColor Green
-    } catch {
-      Write-Host ("could not restore {0}: {1}" -f $e.Name, $_.Exception.Message) -ForegroundColor Red
-      [void]$failed.Add($e)
-    }
-  }
-  # keep whatever could not be restored, so a second attempt is still possible
-  if ($failed.Count -eq 0) { Remove-Item $UndoFile }
-  else { ConvertTo-Json -InputObject @($failed) -Depth 5 | Out-File $UndoFile -Encoding utf8 }
-}
-
 # --- scan --------------------------------------------------------------------
-# -All keeps the rows the scan would otherwise drop, marked as nothing to do, so
-# the tab can show the whole machine instead of only what it wants to change.
-function Get-Findings([switch]$All) {
+# Every process and service, with the ones worth changing marked by
+# Confidence (Known or Guess) and the rest as Leave.
+function Get-Findings {
   $found = New-Object System.Collections.ArrayList
   $autoNames = Get-AutoStartNames
   $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime
@@ -516,12 +422,10 @@ function Get-Findings([switch]$All) {
   foreach ($g in ($procs | Group-Object ProcessName)) {
     $ram = [math]::Round((($g.Group | Measure-Object WorkingSet64 -Sum).Sum) / 1MB, 1)
     if (Test-Match $g.Name $Protected) {
-      if ($All) {
-        [void]$found.Add([pscustomobject]@{
-          Type = 'Process'; Name = $g.Name; Label = $g.Name; RamMB = $ram; Count = $g.Count
-          Why = 'Windows itself, or something the security stack needs. The tool would never pick this - closing it can crash Windows or sign you out.'
-          Action = 'Kill'; Target = ''; Extra = ''; Confidence = 'Leave'; Mode = ''; System = $true })
-      }
+      [void]$found.Add([pscustomobject]@{
+        Type = 'Process'; Name = $g.Name; Label = $g.Name; RamMB = $ram; Count = $g.Count
+        Why = 'Windows itself, or something the security stack needs. The tool would never pick this - closing it can crash Windows or sign you out.'
+        Action = 'Kill'; Target = ''; Extra = ''; Confidence = 'Leave'; Mode = ''; System = $true })
       continue
     }
     $s = Get-Suggestion $g.Name $null
@@ -538,11 +442,11 @@ function Get-Findings([switch]$All) {
     $first = $g.Group[0]
     $path = try { $first.Path } catch { '' }
     if (-not $path) {
-      if ($All) { & $leave 'Process' $g.Name $g.Name $ram $g.Count 'Windows will not say where this one runs from, so it is left alone.' '' '' }
+      & $leave 'Process' $g.Name $g.Name $ram $g.Count 'Windows will not say where this one runs from, so it is left alone.' '' ''
       continue
     }
     if ($path -like "$env:SystemRoot\*") {
-      if ($All) { & $leave 'Process' $g.Name $g.Name $ram $g.Count 'Runs from the Windows folder, so it is part of Windows.' '' '' }
+      & $leave 'Process' $g.Name $g.Name $ram $g.Count 'Runs from the Windows folder, so it is part of Windows.' '' ''
       continue
     }
     $started = try { $first.StartTime } catch { $null }
@@ -557,11 +461,9 @@ function Get-Findings([switch]$All) {
     }
     $guess = Get-ProcessGuess $info
     if ($guess.Score -lt 5) {
-      if ($All) {
-        $why = $(if ($guess.Reasons.Count) { 'Nothing worth flagging: ' + ($guess.Reasons -join '; ') + '.' }
-                 else { 'Left alone on purpose - this is the kind of program the guesswork stays away from.' })
-        & $leave 'Process' $g.Name $g.Name $ram $g.Count $why '' ''
-      }
+      $why = $(if ($guess.Reasons.Count) { 'Nothing worth flagging: ' + ($guess.Reasons -join '; ') + '.' }
+               else { 'Left alone on purpose - this is the kind of program the guesswork stays away from.' })
+      & $leave 'Process' $g.Name $g.Name $ram $g.Count $why '' ''
       continue
     }
     [void]$found.Add([pscustomobject]@{
@@ -577,15 +479,13 @@ function Get-Findings([switch]$All) {
       $ram = [math]::Round($byId[[int]$svc.ProcessId].WorkingSet64 / 1MB, 1)
     }
     if ($svc.StartMode -ne 'Auto') {
-      if ($All) {
-        $why = $(if ($svc.StartMode -eq 'Disabled') { 'Already disabled: it cannot start at all.' }
-                 else { 'Starts only when something asks for it, not with Windows.' })
-        & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 $why $svc.State $svc.StartMode (Test-Match $svc.Name $ProtectedServices)
-      }
+      $why = $(if ($svc.StartMode -eq 'Disabled') { 'Already disabled: it cannot start at all.' }
+               else { 'Starts only when something asks for it, not with Windows.' })
+      & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 $why $svc.State $svc.StartMode (Test-Match $svc.Name $ProtectedServices)
       continue
     }
     if (Test-Match $svc.Name $ProtectedServices) {
-      if ($All) { & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 'Windows needs this one. The tool would never pick it - changing it can break logging in, networking or sound.' $svc.State $svc.StartMode $true }
+      & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 'Windows needs this one. The tool would never pick it - changing it can break logging in, networking or sound.' $svc.State $svc.StartMode $true
       continue
     }
     $s = Get-Suggestion $svc.Name $svc.DisplayName
@@ -602,11 +502,9 @@ function Get-Findings([switch]$All) {
     $guess = Get-ServiceGuess ([pscustomobject]@{
       Name = $svc.Name; DisplayName = $svc.DisplayName; PathName = $exe; State = $svc.State })
     if ($guess.Score -lt 4) {
-      if ($All) {
-        $why = $(if ($exe -like "$env:SystemRoot\*") { 'A Windows service set to start with Windows. Left alone.' }
-                 else { 'Starts with Windows, but nothing about it looks like an updater or a helper.' })
-        & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 $why $svc.State $svc.StartMode
-      }
+      $why = $(if ($exe -like "$env:SystemRoot\*") { 'A Windows service set to start with Windows. Left alone.' }
+               else { 'Starts with Windows, but nothing about it looks like an updater or a helper.' })
+      & $leave 'Service' $svc.Name $svc.DisplayName $ram 1 $why $svc.State $svc.StartMode
       continue
     }
     [void]$found.Add([pscustomobject]@{
@@ -624,22 +522,14 @@ function Get-Findings([switch]$All) {
 function Invoke-Finding($f) {
   if ($f.Action -eq 'Kill') {
     Stop-Process -Name $f.Name -Force -ErrorAction Stop
-    Write-Host ("      closed {0} (freed about {1} MB)" -f $f.Name, $f.RamMB) -ForegroundColor Green
     return $f.RamMB
   }
   $target = $(if ($f.Target) { $f.Target } else { 'Manual' })
   if ("$($f.Mode)" -eq 'Disabled') { throw 'already disabled, nothing left to turn off' }
-  if (-not (Test-Admin)) {
-    Write-Host '      needs Administrator - skipped.' -ForegroundColor Yellow
-    return 0
-  }
+  if (-not (Test-Admin)) { throw 'needs Administrator' }
   $svc = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $f.Name)
-  Add-UndoEntry ([pscustomobject]@{
-    Type = 'Service'; Name = $f.Name; Previous = $svc.StartMode; When = (Get-Date).ToString('s')
-  })
   Set-Service -Name $f.Name -StartupType $target -ErrorAction Stop
   if ($svc.State -eq 'Running') { Stop-Service -Name $f.Name -Force -ErrorAction SilentlyContinue }
-  Write-Host ("      {0} set to {1}" -f $f.Name, $target) -ForegroundColor Green
   return $f.RamMB
 }
 
@@ -1087,18 +977,10 @@ function Get-NetNotes {
 function Invoke-NetFix($Row) {
   if (-not (Test-Admin)) { throw 'needs Administrator' }
   if ($Row.Kind -eq 'TaskOffload') {
-    Add-UndoEntry ([pscustomobject]@{
-      Type = 'TcpipReg'; Name = 'DisableTaskOffload'; Previous = $Row.Current; When = (Get-Date).ToString('s') })
     Remove-ItemProperty -Path $TcpipKey -Name DisableTaskOffload -ErrorAction Stop
   } elseif ($Row.Kind -eq 'Property') {
-    Add-UndoEntry ([pscustomobject]@{
-      Type = 'NetProperty'; Adapter = $Row.Adapter; Name = $Row.Setting
-      Previous = $Row.Current; When = (Get-Date).ToString('s') })
     Set-NetAdapterAdvancedProperty -Name $Row.Adapter -DisplayName $Row.Setting -DisplayValue $Row.Target -ErrorAction Stop
   } else {
-    Add-UndoEntry ([pscustomobject]@{
-      Type = 'NetPower'; Adapter = $Row.Adapter; Name = 'AllowComputerToTurnOffDevice'
-      Previous = $Row.Current; When = (Get-Date).ToString('s') })
     $pm = Get-NetAdapterPowerManagement -Name $Row.Adapter -ErrorAction Stop
     $pm.AllowComputerToTurnOffDevice = 'Disabled'
     Set-NetAdapterPowerManagement -InputObject $pm -ErrorAction Stop
@@ -1282,20 +1164,13 @@ function Get-AppFindings {
   foreach ($e in @(Get-AppStartupEntries)) {
     [void]$rows.Add([pscustomobject]@{
       App = $e.Name; Action = 'Startup'; Status = $e.Where; Target = 'Disabled'
-      Effect = 'Stops it opening with Windows. Launch it yourself when you need it.'
+      Effect = $(if ($e.Kind -eq 'File') { "Moves the shortcut to $StartupParked. Move it back to turn it on again." }
+                 else { 'Stops it opening with Windows. Launch it yourself when you need it.' })
       Why = "$($e.Where): $($e.Data)"; Data = $e; Plan = $null; Bytes = 0 })
   }
 
-  # 2. the apps in the catalog that are running or have a cache
+  # 2. the apps in the catalog that have a cache worth clearing
   foreach ($app in Get-AppPlans) {
-    $processes = @(Get-Process -Name $app.Process -ErrorAction SilentlyContinue)
-    if ($processes.Count -gt 0) {
-      $ram = [math]::Round((($processes | Measure-Object WorkingSet64 -Sum).Sum) / 1MB, 0)
-      [void]$rows.Add([pscustomobject]@{
-        App = $app.Name; Action = 'Close'; Status = "$($processes.Count) running, $ram MB"; Target = 'Closed'
-        Effect = 'Frees the RAM and CPU it is using now. It reopens when you launch it.'
-        Why = 'The app is running right now.'; Data = $null; Plan = $app; Bytes = 0 })
-    }
     $paths = @($app.Cache | Where-Object { $_ -and (Test-Path $_) })
     if ($paths.Count -gt 0) {
       $bytes = 0
@@ -1331,11 +1206,11 @@ function Get-AppFindings {
     [void]$rows.Add([pscustomobject]@{
       App = $a.Label; Action = 'Uninstall'; Status = 'Installed'; Target = 'Removed'
       Effect = 'Removes the app for this account. Reinstall it from the Microsoft Store if you want it back.'
-      Why = "Store app $($pkg.Name). This cannot be undone by the Undo log - only by reinstalling."
+      Why = "Store app $($pkg.Name). The only way back is reinstalling it from the Store."
       Data = $pkg; Plan = $null; Bytes = 0 })
   }
 
-  $rows | Sort-Object -Property @{E = { switch ($_.Action) { 'Startup' { 0 } 'Close' { 1 } 'Cache' { 2 } default { 3 } } }},
+  $rows | Sort-Object -Property @{E = { switch ($_.Action) { 'Startup' { 0 } 'Cache' { 1 } default { 2 } } }},
                                 @{E = 'Bytes'; D = $true}, 'App'
 }
 
@@ -1345,7 +1220,6 @@ function Invoke-AppAction($Row) {
       $e = $Row.Data
       if ($e.Kind -eq 'Run') {
         if (-not (Test-Admin) -and $e.Key -like 'HKLM:*') { throw 'this one is machine-wide and needs Administrator' }
-        Add-UndoEntry ([pscustomobject]@{ Type = 'AppStartup'; Key = $e.Key; Name = $e.Name; Data = $e.Data; When = (Get-Date).ToString('s') })
         Remove-ItemProperty -Path $e.Key -Name $e.Name -ErrorAction Stop
         return
       }
@@ -1353,16 +1227,10 @@ function Invoke-AppAction($Row) {
         if (-not (Test-Path $StartupParked)) { [void](New-Item -ItemType Directory -Path $StartupParked -Force) }
         $parked = Join-Path $StartupParked (Split-Path $e.Data -Leaf)
         # the undo entry carries where it came from, so it can be moved back
-        Add-UndoEntry ([pscustomobject]@{ Type = 'StartupFile'; Name = $e.Data; Data = $parked; When = (Get-Date).ToString('s') })
         Move-Item -Path $e.Data -Destination $parked -Force -ErrorAction Stop
         return
       }
-      Add-UndoEntry ([pscustomobject]@{ Type = 'Task'; Name = $e.Name; Data = $e.Key; When = (Get-Date).ToString('s') })
       Disable-ScheduledTask -TaskName $e.Name -TaskPath $e.Key -ErrorAction Stop | Out-Null
-      return
-    }
-    'Close' {
-      Get-Process -Name $Row.Plan.Process -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Stop
       return
     }
     'Uninstall' {
@@ -1385,28 +1253,23 @@ function Invoke-AppAction($Row) {
 }
 
 # --- windows settings --------------------------------------------------------
-# Each switch mirrors one toggle in the Settings app, and records what the value
-# was before it changed.
+# Each switch mirrors one toggle in the Settings app.
 function Get-RegValue([string]$Path, [string]$Name) {
   return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
 }
 
-function Set-RegValueLogged([string]$Path, [string]$Name, $Value, [string]$Kind) {
-  $old = Get-RegValue $Path $Name
-  Add-UndoEntry ([pscustomobject]@{
-    Type = 'RegValue'; Path = $Path; Name = $Name; Existed = ($null -ne $old)
-    Previous = $old; Kind = $Kind; When = (Get-Date).ToString('s') })
-  if (-not (Test-Path $Path)) { [void](New-Item -Path $Path -Force) }
-  New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Kind -Force | Out-Null
+function Set-RegValue([string]$Path, [string]$Name, $Value, [string]$Kind) {
+  if (-not (Test-Path $Path)) { [void](New-Item -Path $Path -Force -ErrorAction Stop) }
+  New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Kind -Force -ErrorAction Stop | Out-Null
+  # Windows blocks writes to some values outright, so trust the read, not the write
+  $back = Get-RegValue $Path $Name
+  if ("$back" -ne "$Value") { throw "Windows did not keep the new value for $Name" }
 }
 
-function Remove-RegValueLogged([string]$Path, [string]$Name, [string]$Kind) {
-  $old = Get-RegValue $Path $Name
-  if ($null -eq $old) { return }
-  Add-UndoEntry ([pscustomobject]@{
-    Type = 'RegValue'; Path = $Path; Name = $Name; Existed = $true
-    Previous = $old; Kind = $Kind; When = (Get-Date).ToString('s') })
+function Remove-RegValue([string]$Path, [string]$Name, [string]$Kind) {
+  if ($null -eq (Get-RegValue $Path $Name)) { return }
   Remove-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+  if ($null -ne (Get-RegValue $Path $Name)) { throw "Windows kept $Name in place" }
 }
 
 # animations keep running in open windows until Windows is told about the change
@@ -1453,7 +1316,7 @@ function Get-GroupState([string]$Path, [string[]]$Names, [int]$Default = 1) {
 }
 
 function Set-GroupState([string]$Path, [string[]]$Names, [bool]$On) {
-  foreach ($n in $Names) { Set-RegValueLogged $Path $n $(if ($On) { 1 } else { 0 }) 'DWord' }
+  foreach ($n in $Names) { Set-RegValue $Path $n $(if ($On) { 1 } else { 0 }) 'DWord' }
 }
 
 # pointer acceleration is a system parameter, not just three registry strings
@@ -1461,6 +1324,10 @@ function Update-MouseSetting([bool]$On) {
   if (-not ('TsakasNative' -as [type])) { return }
   $values = $(if ($On) { @(6, 10, 1) } else { @(0, 0, 0) })
   [void][TsakasNative]::SystemParametersInfoArray(0x0004, 0, $values, 2)   # SPI_SETMOUSE
+}
+
+function Test-WidgetsInstalled {
+  return $null -ne (Get-AppxPackage -Name 'MicrosoftWindows.Client.WebExperience' -ErrorAction SilentlyContinue)
 }
 
 function Get-WinSettings {
@@ -1472,8 +1339,8 @@ function Get-WinSettings {
       Admin = $true
       Read  = { $v = Get-RegValue $DoPolicyKey 'DODownloadMode'; return ($null -eq $v -or [int]$v -ne 0) }
       Write = { param($on)
-        if ($on) { Remove-RegValueLogged $DoPolicyKey 'DODownloadMode' 'DWord' }
-        else     { Set-RegValueLogged $DoPolicyKey 'DODownloadMode' 0 'DWord' } }
+        if ($on) { Remove-RegValue $DoPolicyKey 'DODownloadMode' 'DWord' }
+        else     { Set-RegValue $DoPolicyKey 'DODownloadMode' 0 'DWord' } }
     }
     [pscustomobject]@{
       Group = 'Performance'
@@ -1481,7 +1348,7 @@ function Get-WinSettings {
       Sub   = 'Blur behind Start, the taskbar and menus. Costs a little GPU time every frame.'
       Admin = $false
       Read  = { $v = Get-RegValue $PersonalizeKey 'EnableTransparency'; return ($null -eq $v -or [int]$v -ne 0) }
-      Write = { param($on) Set-RegValueLogged $PersonalizeKey 'EnableTransparency' $(if ($on) { 1 } else { 0 }) 'DWord' }
+      Write = { param($on) Set-RegValue $PersonalizeKey 'EnableTransparency' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Performance'
@@ -1490,7 +1357,7 @@ function Get-WinSettings {
       Admin = $false
       Read  = { $v = Get-RegValue $MetricsKey 'MinAnimate'; return ($null -eq $v -or "$v" -ne '0') }
       Write = { param($on)
-        Set-RegValueLogged $MetricsKey 'MinAnimate' $(if ($on) { '1' } else { '0' }) 'String'
+        Set-RegValue $MetricsKey 'MinAnimate' $(if ($on) { '1' } else { '0' }) 'String'
         Update-AnimationSetting $on }
     }
     [pscustomobject]@{
@@ -1500,8 +1367,8 @@ function Get-WinSettings {
       Admin = $false
       Read  = { $v = Get-RegValue $GameDvrKey 'AppCaptureEnabled'; return ($null -eq $v -or [int]$v -ne 0) }
       Write = { param($on)
-        Set-RegValueLogged $GameDvrKey 'AppCaptureEnabled' $(if ($on) { 1 } else { 0 }) 'DWord'
-        Set-RegValueLogged $GameStoreKey 'GameDVR_Enabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+        Set-RegValue $GameDvrKey 'AppCaptureEnabled' $(if ($on) { 1 } else { 0 }) 'DWord'
+        Set-RegValue $GameStoreKey 'GameDVR_Enabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Performance'
@@ -1509,7 +1376,7 @@ function Get-WinSettings {
       Sub   = 'Windows gives the running game priority and holds back background work. Worth leaving on.'
       Admin = $false
       Read  = { $v = Get-RegValue $GameBarKey 'AutoGameModeEnabled'; return ($null -eq $v -or [int]$v -ne 0) }
-      Write = { param($on) Set-RegValueLogged $GameBarKey 'AutoGameModeEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+      Write = { param($on) Set-RegValue $GameBarKey 'AutoGameModeEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Performance'
@@ -1519,9 +1386,6 @@ function Get-WinSettings {
       Read  = { $svc = Get-Service MapsBroker -ErrorAction SilentlyContinue
                 return ($null -ne $svc -and $svc.StartType -eq 'Automatic') }
       Write = { param($on)
-        $svc = Get-Service MapsBroker -ErrorAction Stop
-        Add-UndoEntry ([pscustomobject]@{
-          Type = 'Service'; Name = 'MapsBroker'; Previous = "$($svc.StartType)"; When = (Get-Date).ToString('s') })
         if ($on) { Set-Service -Name MapsBroker -StartupType Automatic -ErrorAction Stop }
         else {
           Set-Service -Name MapsBroker -StartupType Manual -ErrorAction Stop
@@ -1534,7 +1398,7 @@ function Get-WinSettings {
       Sub   = 'Lets Store apps keep running when you are not using them. Off stops them waking up on their own.'
       Admin = $false
       Read  = { $v = Get-RegValue $BackgroundKey 'GlobalUserDisabled'; return ($null -eq $v -or [int]$v -eq 0) }
-      Write = { param($on) Set-RegValueLogged $BackgroundKey 'GlobalUserDisabled' $(if ($on) { 0 } else { 1 }) 'DWord' }
+      Write = { param($on) Set-RegValue $BackgroundKey 'GlobalUserDisabled' $(if ($on) { 0 } else { 1 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Performance'
@@ -1542,7 +1406,7 @@ function Get-WinSettings {
       Sub   = 'The GPU manages its own work queue instead of the CPU. Helps frame pacing and latency. Needs a restart.'
       Admin = $true
       Read  = { $v = Get-RegValue $GpuKey 'HwSchMode'; return ($null -eq $v -or [int]$v -ne 1) }
-      Write = { param($on) Set-RegValueLogged $GpuKey 'HwSchMode' $(if ($on) { 2 } else { 1 }) 'DWord' }
+      Write = { param($on) Set-RegValue $GpuKey 'HwSchMode' $(if ($on) { 2 } else { 1 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Performance'
@@ -1550,7 +1414,7 @@ function Get-WinSettings {
       Sub   = 'Shutdown saves part of the session instead of closing fully. Off fixes drivers and USB devices behaving oddly after a shutdown.'
       Admin = $true
       Read  = { $v = Get-RegValue $PowerKey 'HiberbootEnabled'; return ($null -eq $v -or [int]$v -ne 0) }
-      Write = { param($on) Set-RegValueLogged $PowerKey 'HiberbootEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+      Write = { param($on) Set-RegValue $PowerKey 'HiberbootEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Performance'
@@ -1559,9 +1423,9 @@ function Get-WinSettings {
       Admin = $false
       Read  = { $v = Get-RegValue $MouseKey 'MouseSpeed'; return ($null -eq $v -or "$v" -ne '0') }
       Write = { param($on)
-        Set-RegValueLogged $MouseKey 'MouseSpeed' $(if ($on) { '1' } else { '0' }) 'String'
-        Set-RegValueLogged $MouseKey 'MouseThreshold1' $(if ($on) { '6' } else { '0' }) 'String'
-        Set-RegValueLogged $MouseKey 'MouseThreshold2' $(if ($on) { '10' } else { '0' }) 'String'
+        Set-RegValue $MouseKey 'MouseSpeed' $(if ($on) { '1' } else { '0' }) 'String'
+        Set-RegValue $MouseKey 'MouseThreshold1' $(if ($on) { '6' } else { '0' }) 'String'
+        Set-RegValue $MouseKey 'MouseThreshold2' $(if ($on) { '10' } else { '0' }) 'String'
         Update-MouseSetting $on }
     }
     [pscustomobject]@{
@@ -1570,7 +1434,7 @@ function Get-WinSettings {
       Sub   = 'Allow apps to take screenshots and record your screen. Desktop tools like OBS, ShareX and Snipping Tool are not affected.'
       Admin = $false
       Read  = { $v = Get-RegValue $CaptureKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
-      Write = { param($on) Set-RegValueLogged $CaptureKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
+      Write = { param($on) Set-RegValue $CaptureKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1578,7 +1442,7 @@ function Get-WinSettings {
       Sub   = 'Allow apps to take a screenshot of one window without its border.'
       Admin = $false
       Read  = { $v = Get-RegValue $CaptureNoBorderKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
-      Write = { param($on) Set-RegValueLogged $CaptureNoBorderKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
+      Write = { param($on) Set-RegValue $CaptureNoBorderKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1586,7 +1450,7 @@ function Get-WinSettings {
       Sub   = 'Lets apps tie the ads they show you to one ID for this account.'
       Admin = $false
       Read  = { $v = Get-RegValue $AdvertKey 'Enabled'; return ($null -eq $v -or [int]$v -ne 0) }
-      Write = { param($on) Set-RegValueLogged $AdvertKey 'Enabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+      Write = { param($on) Set-RegValue $AdvertKey 'Enabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1594,7 +1458,7 @@ function Get-WinSettings {
       Sub   = 'Lets Microsoft use your diagnostic data to pick tips, ads and recommendations for you.'
       Admin = $false
       Read  = { $v = Get-RegValue $PrivacyKey 'TailoredExperiencesWithDiagnosticDataEnabled'; return ($null -eq $v -or [int]$v -ne 0) }
-      Write = { param($on) Set-RegValueLogged $PrivacyKey 'TailoredExperiencesWithDiagnosticDataEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
+      Write = { param($on) Set-RegValue $PrivacyKey 'TailoredExperiencesWithDiagnosticDataEnabled' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1603,8 +1467,8 @@ function Get-WinSettings {
       Admin = $true
       Read  = { $v = Get-RegValue $TelemetryKey 'AllowTelemetry'; return ($null -eq $v -or [int]$v -ne 0) }
       Write = { param($on)
-        if ($on) { Remove-RegValueLogged $TelemetryKey 'AllowTelemetry' 'DWord' }
-        else     { Set-RegValueLogged $TelemetryKey 'AllowTelemetry' 0 'DWord' } }
+        if ($on) { Remove-RegValue $TelemetryKey 'AllowTelemetry' 'DWord' }
+        else     { Set-RegValue $TelemetryKey 'AllowTelemetry' 0 'DWord' } }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1613,8 +1477,8 @@ function Get-WinSettings {
       Admin = $true
       Read  = { $v = Get-RegValue $ActivityKey 'PublishUserActivities'; return ($null -eq $v -or [int]$v -ne 0) }
       Write = { param($on)
-        if ($on) { Remove-RegValueLogged $ActivityKey 'PublishUserActivities' 'DWord' }
-        else     { Set-RegValueLogged $ActivityKey 'PublishUserActivities' 0 'DWord' } }
+        if ($on) { Remove-RegValue $ActivityKey 'PublishUserActivities' 'DWord' }
+        else     { Set-RegValue $ActivityKey 'PublishUserActivities' 0 'DWord' } }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1624,9 +1488,9 @@ function Get-WinSettings {
       Read  = { $v = Get-RegValue $InputPersKey 'RestrictImplicitTextCollection'; return ($null -eq $v -or [int]$v -eq 0) }
       Write = { param($on)
         $block = $(if ($on) { 0 } else { 1 })
-        Set-RegValueLogged $InputPersKey 'RestrictImplicitTextCollection' $block 'DWord'
-        Set-RegValueLogged $InputPersKey 'RestrictImplicitInkCollection' $block 'DWord'
-        Set-RegValueLogged "$InputPersKey\TrainedDataStore" 'HarvestContacts' $(if ($on) { 1 } else { 0 }) 'DWord' }
+        Set-RegValue $InputPersKey 'RestrictImplicitTextCollection' $block 'DWord'
+        Set-RegValue $InputPersKey 'RestrictImplicitInkCollection' $block 'DWord'
+        Set-RegValue "$InputPersKey\TrainedDataStore" 'HarvestContacts' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1634,7 +1498,7 @@ function Get-WinSettings {
       Sub   = 'Sends your voice to Microsoft for dictation and voice apps. Windows Speech Recognition still works offline.'
       Admin = $false
       Read  = { $v = Get-RegValue $SpeechKey 'HasAccepted'; return ($null -ne $v -and [int]$v -ne 0) }
-      Write = { param($on) Set-RegValueLogged $SpeechKey 'HasAccepted' $(if ($on) { 1 } else { 0 }) 'DWord' }
+      Write = { param($on) Set-RegValue $SpeechKey 'HasAccepted' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1642,7 +1506,7 @@ function Get-WinSettings {
       Sub   = 'Allow apps to see where this PC is. Weather and Maps use it; most other apps do not need it.'
       Admin = $false
       Read  = { $v = Get-RegValue $LocationKey 'Value'; return ($null -eq $v -or "$v" -ne 'Deny') }
-      Write = { param($on) Set-RegValueLogged $LocationKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
+      Write = { param($on) Set-RegValue $LocationKey 'Value' $(if ($on) { 'Allow' } else { 'Deny' }) 'String' }
     }
     [pscustomobject]@{
       Group = 'Privacy'
@@ -1651,8 +1515,8 @@ function Get-WinSettings {
       Admin = $false
       Read  = { $v = Get-RegValue $FeedbackKey 'NumberOfSIUFInPeriod'; return ($null -eq $v -or [int]$v -ne 0) }
       Write = { param($on)
-        if ($on) { Remove-RegValueLogged $FeedbackKey 'NumberOfSIUFInPeriod' 'DWord' }
-        else     { Set-RegValueLogged $FeedbackKey 'NumberOfSIUFInPeriod' 0 'DWord' } }
+        if ($on) { Remove-RegValue $FeedbackKey 'NumberOfSIUFInPeriod' 'DWord' }
+        else     { Set-RegValue $FeedbackKey 'NumberOfSIUFInPeriod' 0 'DWord' } }
     }
     [pscustomobject]@{
       Group = 'Suggestions and ads'
@@ -1684,7 +1548,7 @@ function Get-WinSettings {
       Sub   = 'The OneDrive and Office adverts that appear as notifications inside File Explorer.'
       Admin = $false
       Read  = { $v = Get-RegValue $AdvancedKey 'ShowSyncProviderNotifications'; return ($null -eq $v -or [int]$v -ne 0) }
-      Write = { param($on) Set-RegValueLogged $AdvancedKey 'ShowSyncProviderNotifications' $(if ($on) { 1 } else { 0 }) 'DWord' }
+      Write = { param($on) Set-RegValue $AdvancedKey 'ShowSyncProviderNotifications' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Suggestions and ads'
@@ -1699,8 +1563,9 @@ function Get-WinSettings {
       Title = 'Widgets'
       Sub   = 'The news and weather panel on the taskbar, and the background process behind it.'
       Admin = $false
+      Available = { Test-WidgetsInstalled }
       Read  = { $v = Get-RegValue $AdvancedKey 'TaskbarDa'; return ($null -eq $v -or [int]$v -ne 0) }
-      Write = { param($on) Set-RegValueLogged $AdvancedKey 'TaskbarDa' $(if ($on) { 1 } else { 0 }) 'DWord' }
+      Write = { param($on) Set-RegValue $AdvancedKey 'TaskbarDa' $(if ($on) { 1 } else { 0 }) 'DWord' }
     }
     [pscustomobject]@{
       Group = 'Suggestions and ads'
@@ -1708,7 +1573,7 @@ function Get-WinSettings {
       Sub   = 'The Copilot button and its background process. Nothing else on the taskbar changes.'
       Admin = $false
       Read  = { $v = Get-RegValue $CopilotKey 'TurnOffWindowsCopilot'; return ($null -eq $v -or [int]$v -eq 0) }
-      Write = { param($on) Set-RegValueLogged $CopilotKey 'TurnOffWindowsCopilot' $(if ($on) { 0 } else { 1 }) 'DWord' }
+      Write = { param($on) Set-RegValue $CopilotKey 'TurnOffWindowsCopilot' $(if ($on) { 0 } else { 1 }) 'DWord' }
     }
   )
 }
@@ -1983,7 +1848,7 @@ function Show-Gui {
   Add-Type -AssemblyName System.Drawing
 
   $form = New-Object Windows.Forms.Form
-  $form.Text = "TsakasOptimizer $Version"
+  $form.Text = "TsakasOptimizer $Stage $Version"
   # Fonts are in points and grow with the display on their own. Everything sized
   # in pixels does not, so it is laid out at 100% and scaled once at the end.
   $probe = $form.CreateGraphics()
@@ -2144,7 +2009,7 @@ function Show-Gui {
   $side.Controls.Add($brand)
 
   $verLabel = New-Object Windows.Forms.Label
-  $verLabel.Text = "Version $Version"
+  $verLabel.Text = "$Stage $Version"
   $verLabel.Font = New-Object Drawing.Font($small, 9)
   $verLabel.ForeColor = $muted
   $verLabel.AutoSize = $true
@@ -2402,7 +2267,7 @@ function Show-Gui {
   $btnElev.Location = New-Object Drawing.Point(($tab1.ClientSize.Width - $btnElev.Width - 12), $btnRowY)
 
   $refresh = {
-    $rows = @(Get-Findings -All)
+    $rows = @(Get-Findings)
     $lv.BeginUpdate()
     $lv.Items.Clear()
     foreach ($f in $rows) {
@@ -2510,7 +2375,7 @@ function Show-Gui {
 
   $btnUpdate.Add_Click({
     if (-not $scriptPath) {
-      [void](& $dialog "You launched this straight from GitHub, so you are already on the latest version ($Version)." 'Up to date' 'OK')
+      [void](& $dialog "You launched this straight from GitHub, so you are already on the latest version ($Stage $Version)." 'Up to date' 'OK')
       return
     }
     $btnUpdate.Enabled = $false
@@ -2523,10 +2388,10 @@ function Show-Gui {
     }
     if ([version]$script:online.Version -le [version]$Version) {
       $dot.Visible = $false
-      [void](& $dialog "You are on the latest version ($Version)." 'Up to date' 'OK')
+      [void](& $dialog "You are on the latest version ($Stage $Version)." 'Up to date' 'OK')
       return
     }
-    $ans = & $dialog "Version $($script:online.Version) is available (you have $Version).`r`n`r`nDownload it and restart TsakasOptimizer?" 'Update available' 'YesNo'
+    $ans = & $dialog "$Stage $($script:online.Version) is available (you have $Stage $Version).`r`n`r`nDownload it and restart TsakasOptimizer?" 'Update available' 'YesNo'
     if ($ans -ne 'Yes') { return }
     try {
       Install-Update $script:online.Text
@@ -2907,7 +2772,8 @@ function Show-Gui {
   $tab6.Controls.Add($setList)
 
   $toggles = @()
-  $settings = @(Get-WinSettings)
+  # a switch whose feature is not installed on this PC is left out entirely
+  $settings = @(Get-WinSettings | Where-Object { -not $_.Available -or (& $_.Available) })
   $rowY = 0
   $lastGroup = ''
   for ($i = 0; $i -lt $settings.Count; $i++) {
@@ -3143,8 +3009,6 @@ public static class TsakasNative {
   public static extern void RefreshImmersiveColorPolicyState();
   [DllImport("user32.dll", CharSet = CharSet.Auto)]
   public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
-  [DllImport("user32.dll")]
-  public static extern bool ShowScrollBar(IntPtr hWnd, int bar, bool show);
   [DllImport("user32.dll", SetLastError = true)]
   public static extern bool SystemParametersInfo(uint action, uint param, IntPtr vparam, uint winIni);
   [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")]
@@ -3246,15 +3110,14 @@ function Invoke-SelfTest {
     @{N = 'AnyDesk is not protected';         R = (-not (Test-Match 'AnyDesk' $Protected))}
     @{N = 'services match on display name';   R = ((Get-Suggestion 'gupdate' 'Google Update Service (gupdate)') -ne $null)}
     @{N = 'scan returns objects, not errors'; R = ((@(Get-Findings) | Where-Object { $_ -isnot [pscustomobject] }).Count -eq 0)}
-    @{N = 'the full list is longer than the flagged one'; R = (@(Get-Findings -All).Count -gt @(Get-Findings).Count)}
-    @{N = 'the full list still picks the same rows';      R = (@(Get-Findings -All | Where-Object { $_.Confidence -ne 'Leave' }).Count -eq @(Get-Findings).Count)}
-    @{N = 'every row can be ticked';                      R = (@(Get-Findings -All | Where-Object { $_.Action -ne 'Kill' -and $_.Action -ne 'Service' }).Count -eq 0)}
-    @{N = 'an automatic service steps down to Manual';     R = (@(Get-Findings -All | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Auto' -and $_.Target -ne 'Manual' }).Count -eq 0)}
-    @{N = 'a manual service steps down to Disabled';       R = (@(Get-Findings -All | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Manual' -and $_.Target -ne 'Disabled' }).Count -eq 0)}
-    @{N = 'a disabled service has nowhere left to go';     R = (@(Get-Findings -All | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Disabled' -and $_.Target -ne '' }).Count -eq 0)}
-    @{N = 'every process can be closed by hand';          R = (@(Get-Findings -All | Where-Object { $_.Type -eq 'Process' -and $_.Action -ne 'Kill' }).Count -eq 0)}
+    @{N = 'the list holds more than the picks';           R = (@(Get-Findings).Count -gt @(Get-Findings | Where-Object { $_.Confidence -ne 'Leave' }).Count)}
+    @{N = 'every row can be ticked';                      R = (@(Get-Findings | Where-Object { $_.Action -ne 'Kill' -and $_.Action -ne 'Service' }).Count -eq 0)}
+    @{N = 'an automatic service steps down to Manual';     R = (@(Get-Findings | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Auto' -and $_.Target -ne 'Manual' }).Count -eq 0)}
+    @{N = 'a manual service steps down to Disabled';       R = (@(Get-Findings | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Manual' -and $_.Target -ne 'Disabled' }).Count -eq 0)}
+    @{N = 'a disabled service has nowhere left to go';     R = (@(Get-Findings | Where-Object { $_.Type -eq 'Service' -and $_.Mode -eq 'Disabled' -and $_.Target -ne '' }).Count -eq 0)}
+    @{N = 'every process can be closed by hand';          R = (@(Get-Findings | Where-Object { $_.Type -eq 'Process' -and $_.Action -ne 'Kill' }).Count -eq 0)}
     @{N = 'system processes are listed but never picked'; R = (& {
-        $rows = @(Get-Findings -All | Where-Object { $_.Type -eq 'Process' -and (Test-Match $_.Name $Protected) })
+        $rows = @(Get-Findings | Where-Object { $_.Type -eq 'Process' -and (Test-Match $_.Name $Protected) })
         ($rows.Count -gt 0) -and (@($rows | Where-Object { -not $_.System -or $_.Confidence -ne 'Leave' }).Count -eq 0) })}
   )
 
@@ -3342,35 +3205,10 @@ function Invoke-SelfTest {
     @{N = 'AMD HDMI audio names AMD';            R = ((Get-DriverNote 'Microsoft' (Get-Date) 'hdaudio.inf' 'HDAUDIO\FUNC_01&VEN_1002&DEV_AAF0') -match 'AMD ships one')}
     @{N = 'the 2006 inbox date is not aged';     R = ((Get-DriverNote 'Microsoft' (Get-Date '2006-06-21') 'prnms009.inf' '') -notmatch 'years old')}
     @{N = 'a genuinely old driver still ages';   R = ((Get-DriverNote 'Realtek' (Get-Date '2006-06-20') 'oem11.inf' '') -match 'over 3 years old')}
-    # the undo log: PowerShell 5.1 returns a JSON array as one object, which used
-    # to nest the log on every save and leave undo seeing a single entry
-    @{N = 'undo log keeps every entry';          R = (& {
-        $f = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
-        try {
-          Add-UndoEntry ([pscustomobject]@{ Type = 'Service'; Name = 'A'; Previous = 'Auto' }) $f
-          Add-UndoEntry ([pscustomobject]@{ Type = 'Service'; Name = 'B'; Previous = 'Auto' }) $f
-          Add-UndoEntry ([pscustomobject]@{ Type = 'Service'; Name = 'C'; Previous = 'Auto' }) $f
-          $read = Read-UndoLog $f
-          (@($read).Count -eq 3) -and (@($read)[0].Name -eq 'A') -and (@($read)[2].Name -eq 'C')
-        } finally { Remove-Item $f -ErrorAction SilentlyContinue }
-      })}
-    @{N = 'a log nested by old builds is read'; R = (& {
-        $f = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
-        try {
-          '[{"value":[{"Type":"Service","Name":"A","Previous":"Auto"},{"Type":"Service","Name":"B","Previous":"Auto"}],"Count":2},{"Type":"Service","Name":"C","Previous":"Auto"}]' | Out-File $f -Encoding utf8
-          @(Read-UndoLog $f).Count -eq 3
-        } finally { Remove-Item $f -ErrorAction SilentlyContinue }
-      })}
-    @{N = 'a single-entry log still reads';      R = (& {
-        $f = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
-        try {
-          '{"Type":"Service","Name":"Spooler","Previous":"Auto"}' | Out-File $f -Encoding utf8
-          @(Read-UndoLog $f).Count -eq 1
-        } finally { Remove-Item $f -ErrorAction SilentlyContinue }
-      })}
-    # windows settings
     @{N = 'every switch has a title and a read'; R = (@(Get-WinSettings | Where-Object { $_.Title -and $_.Sub -and $_.Read -and $_.Write }).Count -eq @(Get-WinSettings).Count)}
     @{N = 'every switch reads a true/false';     R = (@(Get-WinSettings | Where-Object { (& $_.Read) -is [bool] }).Count -eq @(Get-WinSettings).Count)}
+    @{N = 'a blocked write is reported, not swallowed'; R = (& {
+        try { Set-RegValue 'HKLM:\SECURITY\TsakasOptimizerSelfTest' 'X' 1 'DWord'; $false } catch { $true } })}
     @{N = 'every switch is in a group';          R = (@(Get-WinSettings | Where-Object { $_.Group }).Count -eq @(Get-WinSettings).Count)}
     @{N = 'switch titles do not repeat';         R = (@(Get-WinSettings | Group-Object Title | Where-Object { $_.Count -gt 1 }).Count -eq 0)}
     @{N = 'a grouped value reads its first key'; R = (& {
@@ -3381,27 +3219,14 @@ function Invoke-SelfTest {
           ((Get-GroupState $key @('A', 'B')) -eq $false) -and ((Get-GroupState $key @('A', 'C')) -eq $true)
         } finally { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue }
       })}
-    @{N = 'a registry write can be undone';      R = (& {
+    @{N = 'a registry value is written and removed'; R = (& {
         $key = 'HKCU:\Software\TsakasOptimizerSelfTest'
-        $log = Join-Path $env:TEMP ("undo-" + [guid]::NewGuid().ToString('N') + ".json")
-        $saved = $script:UndoFile
         try {
-          $script:UndoFile = $log
-          [void](New-Item -Path $key -Force)
-          New-ItemProperty -Path $key -Name 'Kept' -Value 7 -PropertyType DWord -Force | Out-Null
-          Set-RegValueLogged $key 'Kept' 0 'DWord'          # had a value before
-          Set-RegValueLogged $key 'Added' 0 'DWord'         # brand new value
-          $entries = @(Read-UndoLog $log)
-          foreach ($e in $entries) {
-            if ($e.Existed) { New-ItemProperty -Path $e.Path -Name $e.Name -Value $e.Previous -PropertyType $e.Kind -Force | Out-Null }
-            else { Remove-ItemProperty -Path $e.Path -Name $e.Name -ErrorAction SilentlyContinue }
-          }
-          ((Get-RegValue $key 'Kept') -eq 7) -and ($null -eq (Get-RegValue $key 'Added'))
-        } finally {
-          $script:UndoFile = $saved
-          Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item $log -ErrorAction SilentlyContinue
-        }
+          Set-RegValue $key 'Added' 5 'DWord'
+          $wrote = (Get-RegValue $key 'Added') -eq 5
+          Remove-RegValue $key 'Added' 'DWord'
+          $wrote -and ($null -eq (Get-RegValue $key 'Added'))
+        } finally { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue }
       })}
     @{N = 'AM5 desktop chip is detected';        R = ((Test-Am5 'AMD Ryzen 7 7800X3D 8-Core Processor') -and (Test-Am5 'AMD Ryzen 5 8600G w/ Radeon Graphics') -and (Test-Am5 'AMD Ryzen 9 9950X 16-Core'))}
     @{N = 'mobile Ryzen is not called AM5';      R = (-not (Test-Am5 'AMD Ryzen 7 7735HS with Radeon') -and -not (Test-Am5 'AMD Ryzen 9 7945HX'))}
@@ -3428,7 +3253,7 @@ function Invoke-SelfTest {
 # Service start types, machine-wide policies and the Windows caches all need
 # Administrator, so ask for it up front instead of failing halfway through. A
 # refused prompt still opens the app; it just skips what it cannot do.
-if (-not ($SelfTest -or $Undo -or $Console -or $Report) -and -not (Test-Admin) -and $PSCommandPath) {
+if (-not $SelfTest -and -not (Test-Admin) -and $PSCommandPath) {
   try {
     Start-Process powershell -Verb RunAs -ArgumentList @(
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $PSCommandPath) -ErrorAction Stop
@@ -3437,49 +3262,4 @@ if (-not ($SelfTest -or $Undo -or $Console -or $Report) -and -not (Test-Admin) -
 }
 
 if ($SelfTest) { Invoke-SelfTest; return }
-if ($Undo)     { Invoke-Undo;     return }
-if (-not $Console -and -not $Report) { Show-Gui; return }
-
-Write-Host ''
-Write-Host '  TsakasOptimizer - scanning processes and auto-start services...' -ForegroundColor Cyan
-if (-not (Test-Admin)) { Write-Host '  (not running as Administrator - service changes will be skipped)' -ForegroundColor Yellow }
-Write-Host ''
-
-$findings = @(Get-Findings)
-if ($findings.Count -eq 0) {
-  Write-Host '  Nothing worth changing. Machine looks clean.' -ForegroundColor Green
-  return
-}
-
-$freed = 0.0
-$i = 0
-foreach ($f in $findings) {
-  $i++
-  $ram = if ($f.RamMB -gt 0) { "{0} MB" -f $f.RamMB } else { "-" }
-  $cnt = if ($f.Count -gt 1) { " x$($f.Count)" } else { "" }
-  $st  = if ($f.Extra) { ", $($f.Extra)" } else { "" }
-  $sug = if ($f.Action -eq 'Kill') { 'close it now' } else { 'set start type to Manual (starts on demand)' }
-
-  $tag = if ($f.Confidence -eq 'Guess') { ', guess' } else { '' }
-  Write-Host ("[{0}/{1}] {2}{3}  ({4}{5}, {6}{7})" -f $i, $findings.Count, $f.Label, $cnt, $f.Type, $tag, $ram, $st)
-  Write-Host ("      " + $f.Why) -ForegroundColor DarkGray
-  Write-Host ("      suggested: " + $sug) -ForegroundColor DarkCyan
-
-  if ($Report) { Write-Host ''; continue }
-
-  $ans = Read-Host '      apply? [y]es / [n]o (default) / [q]uit'
-  if ($ans -match '^(q|quit)$') { break }
-  if ($ans -match '^(y|yes)$') {
-    try { $freed += Invoke-Finding $f }
-    catch { Write-Host ("      failed: " + $_.Exception.Message) -ForegroundColor Red }
-  }
-  Write-Host ''
-}
-
-Write-Host ''
-if ($Report) {
-  Write-Host ("  {0} item(s) flagged. Run without -Report to act on them." -f $findings.Count) -ForegroundColor Cyan
-} else {
-  Write-Host ("  Done. Freed about {0} MB." -f [math]::Round($freed,1)) -ForegroundColor Cyan
-}
-Write-Host ''
+Show-Gui
