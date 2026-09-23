@@ -1846,6 +1846,9 @@ function Add-Hairline($Ctrl, $Color, [int]$Radius) {
 function Show-Gui {
   Add-Type -AssemblyName System.Windows.Forms
   Add-Type -AssemblyName System.Drawing
+  # ComCtl32 v6, which is what makes list groups exist at all. Without it
+  # WinForms accepts ShowGroups and the groups, and the control ignores them.
+  [Windows.Forms.Application]::EnableVisualStyles()
 
   $form = New-Object Windows.Forms.Form
   $form.Text = "TsakasOptimizer $Stage $Version"
@@ -2188,6 +2191,18 @@ function Show-Gui {
   $grpDisabled = New-Object Windows.Forms.ListViewGroup('Disabled services')
   $groups = @($grpProcPick, $grpSvcPick, $grpProcs, $grpServices, $grpDisabled)
   foreach ($grp in $groups) { [void]$lv.Groups.Add($grp) }
+  # The two suggested lists open, the long inventories start folded away. The
+  # group's id is internal to WinForms, so it is read the only way there is.
+  $groupIdProp = [Windows.Forms.ListViewGroup].GetProperty('ID', [Reflection.BindingFlags]'NonPublic,Instance')
+  $collapsed = @{}
+  foreach ($grp in $groups) { $collapsed[$grp] = ($grp -ne $grpProcPick -and $grp -ne $grpSvcPick) }
+  $applyGroups = {
+    if (-not ('TsakasGroups' -as [type]) -or -not $lv.IsHandleCreated) { return }
+    foreach ($grp in $groups) {
+      $id = $groupIdProp.GetValue($grp, $null)
+      if ($null -ne $id) { [void][TsakasGroups]::SetState($lv.Handle, [int]$id, [bool]$collapsed[$grp]) }
+    }
+  }.GetNewClosure()
   $tab1.Controls.Add($lv)
 
   $details = New-Object Windows.Forms.TextBox
@@ -2288,6 +2303,7 @@ function Show-Gui {
       $grp.Header = "{0} ({1})" -f ($grp.Header -replace ' \(\d+\)$', ''), $grp.Items.Count
     }
     $lv.EndUpdate()
+    & $applyGroups        # a refill resets the header state, so set it again
 
     $procRows = @($rows | Where-Object { $_.Type -eq 'Process' })
     $svcRows  = @($rows | Where-Object { $_.Type -eq 'Service' })
@@ -3000,6 +3016,42 @@ public class TsakasScroll : NativeWindow {
   }
 }
 
+// A group header only grows a chevron once LVGS_COLLAPSIBLE is set on it, and
+// .NET Framework has no property for that, so the flag is sent to the control.
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct LVGROUP {
+  public int cbSize; public int mask;
+  public IntPtr pszHeader; public int cchHeader;
+  public IntPtr pszFooter; public int cchFooter;
+  public int iGroupId; public int stateMask; public int state; public int uAlign;
+  public IntPtr pszSubtitle; public int cchSubtitle;
+  public IntPtr pszTask; public int cchTask;
+  public IntPtr pszDescriptionTop; public int cchDescriptionTop;
+  public IntPtr pszDescriptionBottom; public int cchDescriptionBottom;
+  public int iTitleImage; public int iExtendedImage; public int iFirstItem; public int cItems;
+  public IntPtr pszSubsetTitle; public int cchSubsetTitle;
+}
+
+public static class TsakasGroups {
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, ref LVGROUP g);
+  private const int LVM_SETGROUPINFO = 0x1093;
+  private const int LVGF_STATE = 0x00000004;
+  private const int LVGS_COLLAPSED = 0x0001;
+  private const int LVGS_COLLAPSIBLE = 0x0008;
+
+  public static long SetState(IntPtr list, int groupId, bool collapsed) {
+    LVGROUP g = new LVGROUP();
+    g.cbSize = Marshal.SizeOf(typeof(LVGROUP));
+    g.mask = LVGF_STATE;
+    g.iGroupId = groupId;
+    g.stateMask = LVGS_COLLAPSIBLE | LVGS_COLLAPSED;
+    g.state = LVGS_COLLAPSIBLE | (collapsed ? LVGS_COLLAPSED : 0);
+    return (long)SendMessage(list, LVM_SETGROUPINFO, new IntPtr(groupId), ref g);
+  }
+  public static int StructSize() { return Marshal.SizeOf(typeof(LVGROUP)); }
+}
+
 public static class TsakasNative {
   [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
   public static extern int SetWindowTheme(IntPtr hWnd, string appName, string idList);
@@ -3089,6 +3141,7 @@ public static class TsakasNative {
   if ($dpiScale -ne 1) { $form.Scale((New-Object Drawing.SizeF($dpiScale, $dpiScale))) }
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { & $fillLast $l $null }
 
+  & $applyGroups
   & $selectSection 0
 
   # bottom-right of the tab page, once the real sizes exist
