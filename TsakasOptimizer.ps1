@@ -24,7 +24,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.3'
+$Version = '13.1.4'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -2182,27 +2182,62 @@ function Show-Gui {
   [void]$lv.Columns.Add('Type', 70)
   [void]$lv.Columns.Add('RAM', 90)
   $lv.Tag = 0                       # the name column is the one that stretches
-  $lv.ShowGroups = $true
-  # one argument, because the two-argument form takes a key first, not the header
-  $grpProcPick = New-Object Windows.Forms.ListViewGroup('Suggested processes')
-  $grpSvcPick  = New-Object Windows.Forms.ListViewGroup('Suggested services')
-  $grpProcs    = New-Object Windows.Forms.ListViewGroup('Processes')
-  $grpServices = New-Object Windows.Forms.ListViewGroup('Services')
-  $grpDisabled = New-Object Windows.Forms.ListViewGroup('Disabled services')
-  $groups = @($grpProcPick, $grpSvcPick, $grpProcs, $grpServices, $grpDisabled)
-  foreach ($grp in $groups) { [void]$lv.Groups.Add($grp) }
-  # The two suggested lists open, the long inventories start folded away. The
-  # group's id is internal to WinForms, so it is read the only way there is.
-  $groupIdProp = [Windows.Forms.ListViewGroup].GetProperty('ID', [Reflection.BindingFlags]'NonPublic,Instance')
-  $collapsed = @{}
-  foreach ($grp in $groups) { $collapsed[$grp] = ($grp -ne $grpProcPick -and $grp -ne $grpSvcPick) }
-  $applyGroups = {
-    if (-not ('TsakasGroups' -as [type]) -or -not $lv.IsHandleCreated) { return }
-    foreach ($grp in $groups) {
-      $id = $groupIdProp.GetValue($grp, $null)
-      if ($null -ne $id) { [void][TsakasGroups]::SetState($lv.Handle, [int]$id, [bool]$collapsed[$grp]) }
+
+  # Sections are rows, not ListView groups. Groups draw their own header in
+  # colours SetWindowTheme cannot reach, so in dark mode they came out grey on
+  # black with a plus box. These are ordinary items the app paints itself.
+  $sections = @(
+    [pscustomobject]@{ Title = 'Suggested processes'; Open = $true
+      Match = { param($f) $f.Confidence -ne 'Leave' -and $f.Type -eq 'Process' } }
+    [pscustomobject]@{ Title = 'Suggested services';  Open = $true
+      Match = { param($f) $f.Confidence -ne 'Leave' -and $f.Type -eq 'Service' } }
+    [pscustomobject]@{ Title = 'Processes';           Open = $false
+      Match = { param($f) $f.Confidence -eq 'Leave' -and $f.Type -eq 'Process' } }
+    [pscustomobject]@{ Title = 'Services';            Open = $false
+      Match = { param($f) $f.Confidence -eq 'Leave' -and $f.Type -eq 'Service' -and $f.Mode -ne 'Disabled' } }
+    [pscustomobject]@{ Title = 'Disabled services';   Open = $false
+      Match = { param($f) $f.Confidence -eq 'Leave' -and $f.Type -eq 'Service' -and $f.Mode -eq 'Disabled' } }
+  )
+  $sectionFill = [Drawing.Color]::FromArgb(31, 31, 37)
+  $chevronOpen = [string][char]0x25BE      # a filled triangle, which the text font has
+  $chevronShut = [string][char]0x25B8
+
+  # script scope on purpose: a scriptblock invoked with & runs in a child scope,
+  # so a plain assignment here would be invisible to the click handlers
+  $script:allRows = @()
+
+  $fillList = {
+    $top = $(if ($lv.TopItem) { $lv.TopItem.Index } else { 0 })
+    $script:filling = $true        # setting Checked below raises ItemCheck
+    $lv.BeginUpdate()
+    $lv.Items.Clear()
+    foreach ($sec in $sections) {
+      $mine = @($script:allRows | Where-Object { & $sec.Match $_ })
+      $head = New-Object Windows.Forms.ListViewItem(("{0}  {1}  ({2})" -f `
+        $(if ($sec.Open) { $chevronOpen } else { $chevronShut }), $sec.Title, $mine.Count))
+      [void]$head.SubItems.Add('')
+      [void]$head.SubItems.Add('')
+      $head.BackColor = $sectionFill
+      $head.ForeColor = $ink
+      $head.Font = New-Object Drawing.Font($semi, 10)
+      $head.Tag = $sec
+      [void]$lv.Items.Add($head)
+      $head.Checked = ($mine.Count -gt 0 -and @($mine | Where-Object { -not $_.Ticked }).Count -eq 0)
+      if (-not $sec.Open) { continue }
+      foreach ($f in $mine) {
+        $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }) + '   ' + $infoMark)
+        [void]$it.SubItems.Add($f.Type)
+        [void]$it.SubItems.Add($(if ($f.RamMB -gt 0) { '{0} MB' -f $f.RamMB } else { '-' }))
+        $it.Tag = $f
+        $it.Checked = [bool]$f.Ticked      # ticks survive a fold and a rescan
+        [void]$lv.Items.Add($it)
+      }
     }
-  }.GetNewClosure()
+    $lv.EndUpdate()
+    $script:filling = $false
+    if ($lv.Items.Count -gt 0) { $lv.EnsureVisible([Math]::Min($top, $lv.Items.Count - 1)) }
+  }
+
   $tab1.Controls.Add($lv)
 
   $details = New-Object Windows.Forms.TextBox
@@ -2244,7 +2279,11 @@ function Show-Gui {
     $what = $(if ($f.Type -eq 'Service') { "{0} service" -f $f.Label } else { "{0}.exe process" -f $f.Name })
     Start-Process ("https://www.google.com/search?q=" + [Uri]::EscapeDataString("what is $what windows"))
   }
-  $lv.Add_DoubleClick({ if ($lv.SelectedItems.Count -gt 0) { & $searchRow $lv.SelectedItems[0].Tag } })
+  $lv.Add_DoubleClick({
+    if ($lv.SelectedItems.Count -eq 0) { return }
+    $tag = $lv.SelectedItems[0].Tag
+    if ($tag -and $tag.PSObject.Properties.Name -notcontains 'Match') { & $searchRow $tag }
+  })
 
   # An information mark after every row's name. The rows themselves are drawn by
   # Windows, so this paints over them once they are down, and the same geometry
@@ -2268,13 +2307,19 @@ function Show-Gui {
     param($s, $e)
     $hit = $s.GetItemAt($e.X, $e.Y)
     if (-not $hit) { return }
+    if ($hit.Tag -and $hit.Tag.PSObject.Properties.Name -contains 'Match') {
+      $hit.Tag.Open = -not $hit.Tag.Open
+      & $fillList
+      return
+    }
     if ((& $infoRect $hit).Contains($e.Location)) { & $searchRow $hit.Tag }
   }.GetNewClosure())
 
   $lv.Add_MouseMove({
     param($s, $e)
     $hit = $s.GetItemAt($e.X, $e.Y)
-    $over = ($hit -and (& $infoRect $hit).Contains($e.Location))
+    $onHead = ($hit -and $hit.Tag -and $hit.Tag.PSObject.Properties.Name -contains 'Match')
+    $over = ($hit -and ($onHead -or (& $infoRect $hit).Contains($e.Location)))
     $want = $(if ($over) { 'Hand' } else { 'Default' })
     if ("$($s.Cursor)" -ne "$want") { $s.Cursor = $want }
   }.GetNewClosure())
@@ -2285,25 +2330,9 @@ function Show-Gui {
 
   $refresh = {
     $rows = @(Get-Findings)
-    $lv.BeginUpdate()
-    $lv.Items.Clear()
-    foreach ($f in $rows) {
-      $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }) + '   ' + $infoMark)
-      [void]$it.SubItems.Add($f.Type)
-      [void]$it.SubItems.Add($(if ($f.RamMB -gt 0) { '{0} MB' -f $f.RamMB } else { '-' }))
-      $it.Group = $(
-        if ($f.Confidence -ne 'Leave') { $(if ($f.Type -eq 'Process') { $grpProcPick } else { $grpSvcPick }) }
-        elseif ($f.Type -eq 'Process') { $grpProcs }
-        elseif ($f.Mode -eq 'Disabled') { $grpDisabled }
-        else { $grpServices })
-      $it.Tag = $f
-      [void]$lv.Items.Add($it)
-    }
-    foreach ($grp in $groups) {
-      $grp.Header = "{0} ({1})" -f ($grp.Header -replace ' \(\d+\)$', ''), $grp.Items.Count
-    }
-    $lv.EndUpdate()
-    & $applyGroups        # a refill resets the header state, so set it again
+    foreach ($f in $rows) { Add-Member -InputObject $f -NotePropertyName Ticked -NotePropertyValue $false -Force }
+    $script:allRows = $rows
+    & $fillList
 
     $procRows = @($rows | Where-Object { $_.Type -eq 'Process' })
     $svcRows  = @($rows | Where-Object { $_.Type -eq 'Service' })
@@ -2318,9 +2347,25 @@ function Show-Gui {
   }
   & $refresh
 
+  $lv.Add_ItemCheck({
+    param($s, $e)
+    if ($script:filling) { return }
+    $tag = $lv.Items[$e.Index].Tag
+    if (-not $tag) { return }
+    $want = ($e.NewValue -eq 'Checked')
+    if ($tag.PSObject.Properties.Name -contains 'Match') {
+      # the box on a section header ticks everything in that section
+      foreach ($f in @($script:allRows | Where-Object { & $tag.Match $_ })) { $f.Ticked = $want }
+      $lv.BeginInvoke([Action]{ & $fillList }) | Out-Null
+      return
+    }
+    $tag.Ticked = $want
+  })
+
   $lv.Add_ItemSelectionChanged({
     if ($lv.SelectedItems.Count -gt 0) {
       $f = $lv.SelectedItems[0].Tag
+      if ($f -and $f.PSObject.Properties.Name -contains 'Match') { return }
       $details.Text = "{0}`r`n{1}" -f $f.Why,
         $(if ($f.Action -eq 'Kill') { 'Closing it now. It starts again next time you open the app.' }
           elseif ("$($f.Mode)" -eq 'Disabled') { 'Already disabled - ticking it changes nothing.' }
@@ -2424,29 +2469,30 @@ function Show-Gui {
   $btnRefresh.Add_Click({ & $refresh })
 
   $btnApply.Add_Click({
-    $items = @($lv.CheckedItems)
+    # the rows, not the visible items: a tick inside a folded section still counts
+    $items = @($script:allRows | Where-Object { $_.Ticked })
     if ($items.Count -eq 0) {
       [void](& $dialog 'Tick at least one row first.' 'TsakasOptimizer' 'OK')
       return
     }
     $names = ($items | ForEach-Object {
-      $t = $_.Tag
+      $t = $_
       $(if ($t.Action -eq 'Kill') { "{0} - close it" -f $t.Label }
         elseif ("$($t.Mode)" -eq 'Disabled') { "{0} - already disabled, nothing to change" -f $t.Label }
         else { "{0} - start type {1} to {2}" -f $t.Label, $t.Mode, $t.Target })
     }) -join "`r`n"
-    $system = @($items | Where-Object { $_.Tag.System })
+    $system = @($items | Where-Object { $_.System })
     $warn = $(if ($system.Count) {
       "`r`n`r`nWARNING: {0} of these ({1}) are parts of Windows. Touching them can crash Windows, sign you out, or break networking and sound." -f `
-        $system.Count, (($system | ForEach-Object { $_.Tag.Label }) -join ', ')
+        $system.Count, (($system | ForEach-Object { $_.Label }) -join ', ')
     } else { '' })
     $ans = & $dialog "Apply to these $($items.Count) item(s)?`r`n`r`n$names$warn" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
 
     $freed = 0.0; $errs = @()
-    foreach ($it in $items) {
-      try { $freed += Invoke-Finding $it.Tag }
-      catch { $errs += "{0}: {1}" -f $it.Tag.Label, $_.Exception.Message }
+    foreach ($row in $items) {
+      try { $freed += Invoke-Finding $row }
+      catch { $errs += "{0}: {1}" -f $row.Label, $_.Exception.Message }
     }
     & $refresh
     $status.Text = "Freed about {0} MB.{1}" -f [math]::Round($freed, 1),
@@ -3016,42 +3062,6 @@ public class TsakasScroll : NativeWindow {
   }
 }
 
-// A group header only grows a chevron once LVGS_COLLAPSIBLE is set on it, and
-// .NET Framework has no property for that, so the flag is sent to the control.
-[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-public struct LVGROUP {
-  public int cbSize; public int mask;
-  public IntPtr pszHeader; public int cchHeader;
-  public IntPtr pszFooter; public int cchFooter;
-  public int iGroupId; public int stateMask; public int state; public int uAlign;
-  public IntPtr pszSubtitle; public int cchSubtitle;
-  public IntPtr pszTask; public int cchTask;
-  public IntPtr pszDescriptionTop; public int cchDescriptionTop;
-  public IntPtr pszDescriptionBottom; public int cchDescriptionBottom;
-  public int iTitleImage; public int iExtendedImage; public int iFirstItem; public int cItems;
-  public IntPtr pszSubsetTitle; public int cchSubsetTitle;
-}
-
-public static class TsakasGroups {
-  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-  private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, ref LVGROUP g);
-  private const int LVM_SETGROUPINFO = 0x1093;
-  private const int LVGF_STATE = 0x00000004;
-  private const int LVGS_COLLAPSED = 0x0001;
-  private const int LVGS_COLLAPSIBLE = 0x0008;
-
-  public static long SetState(IntPtr list, int groupId, bool collapsed) {
-    LVGROUP g = new LVGROUP();
-    g.cbSize = Marshal.SizeOf(typeof(LVGROUP));
-    g.mask = LVGF_STATE;
-    g.iGroupId = groupId;
-    g.stateMask = LVGS_COLLAPSIBLE | LVGS_COLLAPSED;
-    g.state = LVGS_COLLAPSIBLE | (collapsed ? LVGS_COLLAPSED : 0);
-    return (long)SendMessage(list, LVM_SETGROUPINFO, new IntPtr(groupId), ref g);
-  }
-  public static int StructSize() { return Marshal.SizeOf(typeof(LVGROUP)); }
-}
-
 public static class TsakasNative {
   [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
   public static extern int SetWindowTheme(IntPtr hWnd, string appName, string idList);
@@ -3141,7 +3151,6 @@ public static class TsakasNative {
   if ($dpiScale -ne 1) { $form.Scale((New-Object Drawing.SizeF($dpiScale, $dpiScale))) }
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { & $fillLast $l $null }
 
-  & $applyGroups
   & $selectSection 0
 
   # bottom-right of the tab page, once the real sizes exist
