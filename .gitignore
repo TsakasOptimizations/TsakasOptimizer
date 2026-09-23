@@ -1,2 +1,3 @@
-optimizer-undo.json
 *.bak
+graphify-out/
+theme.txt

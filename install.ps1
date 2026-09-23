@@ -57,7 +57,7 @@ foreach ($lnk in $links) {
   } catch { }
 }
 
-Write-Host "  Installed version $version to $Dir" -ForegroundColor Green
+Write-Host "  Installed Beta $version to $Dir" -ForegroundColor Green
 Write-Host '  Shortcuts added to the Start Menu and desktop.' -ForegroundColor Green
 Write-Host '  Updates: open it and press Check for updates.' -ForegroundColor DarkGray
 Write-Host ''

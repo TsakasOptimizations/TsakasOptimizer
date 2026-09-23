@@ -24,7 +24,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.4'
+$Version = '13.1.6'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -90,84 +90,82 @@ function Update-SideFiles {
 # web, where there is no icon file on disk. 16/32/48 only; the full icon.ico in
 # the repo is what the installer puts on the shortcut.
 $IconB64 = @(
-  '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'
+  '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'
 ) -join ''
 
 # The embedded .ico stores each size as a PNG. Icon.ToBitmap() cannot decode
@@ -1611,18 +1609,18 @@ function Shift-Color($C, [int]$Amount) {
 # Flat button painted by hand. $Bg is whatever sits behind it, so the rounded
 # corners antialias against it instead of being clipped square by a region. The
 # border darkens toward the bottom edge, which is what gives it a little lift.
-function Set-FluentButton($Btn, $Fill, $Border, $Fore, $Bg, [int]$Radius) {
+# The colours arrive as palette keys, not values, so the button paints in
+# whichever theme is current when the paint happens.
+function Set-FluentButton($Btn, [string]$Fill, [string]$Border, [string]$Fore, [string]$Bg, [int]$Radius) {
   $Btn.FlatStyle = 'Flat'
   $Btn.FlatAppearance.BorderSize = 0
-  $Btn.FlatAppearance.MouseOverBackColor = $Bg
-  $Btn.FlatAppearance.MouseDownBackColor = $Bg
-  $Btn.BackColor = $Bg
-  $Btn.ForeColor = $Fore
+  $Btn.FlatAppearance.MouseOverBackColor = $global:TsakasPal[$Bg]
+  $Btn.FlatAppearance.MouseDownBackColor = $global:TsakasPal[$Bg]
+  $Btn.BackColor = $global:TsakasPal[$Bg]
+  $Btn.ForeColor = $global:TsakasPal[$Fore]
   $Btn.UseVisualStyleBackColor = $false
   $Btn.Region = $null
   $state = New-Object psobject -Property @{ Hot = $false; Down = $false }
-  # light fills darken on hover, dark fills lighten
-  $light = ([int]$Fill.R + $Fill.G + $Fill.B) -gt 600
 
   $Btn.Add_MouseEnter({ $state.Hot = $true;  $Btn.Invalidate() }.GetNewClosure())
   $Btn.Add_MouseLeave({ $state.Hot = $false; $state.Down = $false; $Btn.Invalidate() }.GetNewClosure())
@@ -1632,18 +1630,23 @@ function Set-FluentButton($Btn, $Fill, $Border, $Fore, $Bg, [int]$Radius) {
   $Btn.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
-    $g.Clear($Bg)
+    $bg = $global:TsakasPal[$Bg]
+    $fill = $global:TsakasPal[$Fill]
+    $border = $global:TsakasPal[$Border]
+    $g.Clear($bg)
     $g.SmoothingMode = 'AntiAlias'
     $rect = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
     $path = New-RoundPath $rect $Radius
 
-    $f = $Fill
-    if ($state.Down)    { $f = Shift-Color $Fill $(if ($light) { -14 } else { -18 }) }
-    elseif ($state.Hot) { $f = Shift-Color $Fill $(if ($light) { -6 } else { 14 }) }
-    $fill = New-Object Drawing.SolidBrush($f)
-    $g.FillPath($fill, $path)
+    # a light fill darkens on hover, a dark one lightens
+    $light = ([int]$fill.R + $fill.G + $fill.B) -gt 600
+    $f = $fill
+    if ($state.Down)    { $f = Shift-Color $fill $(if ($light) { -14 } else { -18 }) }
+    elseif ($state.Hot) { $f = Shift-Color $fill $(if ($light) { -6 } else { 14 }) }
+    $brush = New-Object Drawing.SolidBrush($f)
+    $g.FillPath($brush, $path)
 
-    $edge = New-Object Drawing.Drawing2D.LinearGradientBrush($rect, $Border, (Shift-Color $Border -26), 90)
+    $edge = New-Object Drawing.Drawing2D.LinearGradientBrush($rect, $border, (Shift-Color $border -26), 90)
     $pen = New-Object Drawing.Pen($edge, 1)
     $g.DrawPath($pen, $path)
 
@@ -1651,16 +1654,17 @@ function Set-FluentButton($Btn, $Fill, $Border, $Fore, $Bg, [int]$Radius) {
     if ($s.Focused) {
       $ring = New-Object Drawing.Rectangle(3, 3, ($s.Width - 7), ($s.Height - 7))
       $rp = New-RoundPath $ring ([Math]::Max(1, $Radius - 2))
-      $rpen = New-Object Drawing.Pen($Fore, 1)
+      $rpen = New-Object Drawing.Pen($global:TsakasPal[$Fore], 1)
       $g.DrawPath($rpen, $rp)
       $rpen.Dispose(); $rp.Dispose()
     }
 
+    $s.ForeColor = $global:TsakasPal[$Fore]
     $fore = if ($s.Enabled) { $s.ForeColor } else { [Drawing.Color]::FromArgb(150, $s.ForeColor) }
     [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $fore,
       [Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine, EndEllipsis')
 
-    $fill.Dispose(); $edge.Dispose(); $pen.Dispose(); $path.Dispose()
+    $brush.Dispose(); $edge.Dispose(); $pen.Dispose(); $path.Dispose()
   }.GetNewClosure())
 }
 
@@ -1668,7 +1672,7 @@ function Set-FluentButton($Btn, $Fill, $Border, $Fore, $Bg, [int]$Radius) {
 # report panes hide theirs and get this drawn one instead: a 12px lane, a 6px
 # thumb that tracks the control's own scroll position, and no lane at all while
 # everything fits.
-function Add-SlimScrollbar($Ctrl, $Track, $Thumb, $ThumbHot, [double]$Scale = 1) {
+function Add-SlimScrollbar($Ctrl, [string]$Track, [string]$Thumb, [string]$ThumbHot, [double]$Scale = 1) {
   $EM_GETLINECOUNT = 0x00BA; $EM_LINESCROLL = 0x00B6; $EM_GETFIRSTVISIBLELINE = 0x00CE
   $LVM_GETTOPINDEX = 0x1027; $LVM_GETCOUNTPERPAGE = 0x1028
   $isList = $Ctrl -is [Windows.Forms.ListView]
@@ -1684,7 +1688,7 @@ function Add-SlimScrollbar($Ctrl, $Track, $Thumb, $ThumbHot, [double]$Scale = 1)
   $anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
   if ($Ctrl.Anchor -band [Windows.Forms.AnchorStyles]::Bottom) { $anchor = $anchor -bor [Windows.Forms.AnchorStyles]::Bottom }
   $bar.Anchor = $anchor
-  $bar.BackColor = $Track
+  $bar.BackColor = $global:TsakasPal[$Track]
   $Ctrl.Parent.Controls.Add($bar)
   $bar.BringToFront()
 
@@ -1726,10 +1730,11 @@ function Add-SlimScrollbar($Ctrl, $Track, $Thumb, $ThumbHot, [double]$Scale = 1)
     param($s2, $e)
     $m = & $metrics
     $g = $e.Graphics
-    $g.Clear($Track)
+    $bar.BackColor = $global:TsakasPal[$Track]
+    $g.Clear($global:TsakasPal[$Track])
     if ($m.Total -le $m.Per) { return }        # everything fits: no bar at all
     $g.SmoothingMode = 'AntiAlias'
-    $colour = $(if ($st.Hot -or $st.Drag) { $ThumbHot } else { $Thumb })
+    $colour = $(if ($st.Hot -or $st.Drag) { $global:TsakasPal[$ThumbHot] } else { $global:TsakasPal[$Thumb] })
 
     # thumb: 6px wide, centred in the lane, fully rounded ends
     $h = & $thumbHeight $m
@@ -1808,7 +1813,7 @@ function Add-SlimScrollbar($Ctrl, $Track, $Thumb, $ThumbHot, [double]$Scale = 1)
 }
 
 # wraps a control in a padded card and returns the card
-function Add-PaddedCard($Ctrl, [int]$Radius, $LineColor, [int]$Pad, $CardColor) {
+function Add-PaddedCard($Ctrl, [int]$Radius, [string]$LineColor, [int]$Pad, $CardColor) {
   $card = New-Object Windows.Forms.Panel
   $card.Location = $Ctrl.Location
   $card.Size = $Ctrl.Size
@@ -1826,7 +1831,7 @@ function Add-PaddedCard($Ctrl, [int]$Radius, $LineColor, [int]$Pad, $CardColor) 
 }
 
 # a 1px rounded outline drawn by the parent, just outside the control
-function Add-Hairline($Ctrl, $Color, [int]$Radius) {
+function Add-Hairline($Ctrl, [string]$ColorKey, [int]$Radius) {
   if (-not $Ctrl.Parent) { return }
   $h = {
     param($s, $e)
@@ -1834,12 +1839,68 @@ function Add-Hairline($Ctrl, $Color, [int]$Radius) {
     $b.Inflate(1, 1)
     $e.Graphics.SmoothingMode = 'AntiAlias'
     $path = New-RoundPath $b ($Radius + 1)
-    $pen = New-Object Drawing.Pen($Color, 1)
+    $pen = New-Object Drawing.Pen($global:TsakasPal[$ColorKey], 1)
     $e.Graphics.DrawPath($pen, $path)
     $pen.Dispose(); $path.Dispose()
   }.GetNewClosure()
   $Ctrl.Parent.Add_Paint($h)
   $Ctrl.Parent.Invalidate()
+}
+
+# --- theme -------------------------------------------------------------------
+$ThemeFile = Join-Path $Root 'theme.txt'
+
+function Get-ThemeChoice {
+  # the file is only where it is remembered; the variable is what the app reads,
+  # so the switch still works when the install folder cannot be written to
+  if ($null -eq $global:TsakasThemeDark) {
+    $global:TsakasThemeDark = $true          # dark unless told otherwise
+    if (Test-Path $ThemeFile) {
+      try { $global:TsakasThemeDark = ((Get-Content $ThemeFile -Raw).Trim() -ne 'light') } catch { }
+    }
+  }
+  return $global:TsakasThemeDark
+}
+
+function Save-ThemeChoice([bool]$Dark) {
+  $dir = Split-Path $ThemeFile
+  if ($dir -and -not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+  Set-Content -Path $ThemeFile -Value $(if ($Dark) { 'dark' } else { 'light' }) -Encoding utf8
+}
+
+# Every colour the window uses, in one place, so the whole app can change its
+# mind. The accent differs between the two: #0A84FF is only 3.7:1 on white.
+# The palette the window is painting with right now. Paint handlers read it
+# instead of capturing colours, so swapping its contents repaints the app in the
+# other theme without rebuilding a control. It is global rather than script
+# scope because a closure's $script: is its own module, not this file.
+$global:TsakasPal = $null
+$global:TsakasThemeDark = $null
+
+function Get-Palette([bool]$Dark) {
+  $rgb = { param($r, $g, $b) [Drawing.Color]::FromArgb($r, $g, $b) }
+  if ($Dark) {
+    return @{
+      Accent = (& $rgb 10 132 255);  AccentFill = (& $rgb 0 95 184)
+      Ink    = (& $rgb 240 240 242); Muted   = (& $rgb 150 150 158)
+      Line   = (& $rgb 42 42 48);    Panel   = (& $rgb 15 15 17)
+      Card   = (& $rgb 24 24 27);    Section = (& $rgb 31 31 37)
+      BtnFill = (& $rgb 33 33 38);   BtnEdge = (& $rgb 58 58 64)
+      NavSel  = (& $rgb 38 38 44);   NavHover = (& $rgb 28 28 33)
+      BarThumb = (& $rgb 125 125 133); BarHot = (& $rgb 168 168 178)
+      AccentEdge = (& $rgb 0 77 150);  OnAccent = [Drawing.Color]::White
+    }
+  }
+  return @{
+    Accent = (& $rgb 0 95 184);    AccentFill = (& $rgb 0 95 184)
+    Ink    = (& $rgb 22 22 26);    Muted   = (& $rgb 92 92 102)
+    Line   = (& $rgb 220 220 227); Panel   = (& $rgb 243 243 245)
+    Card   = (& $rgb 255 255 255); Section = (& $rgb 236 236 240)
+    BtnFill = (& $rgb 255 255 255); BtnEdge = (& $rgb 201 201 210)
+    NavSel  = (& $rgb 227 227 234); NavHover = (& $rgb 237 237 241)
+    BarThumb = (& $rgb 160 160 170); BarHot = (& $rgb 122 122 134)
+    AccentEdge = (& $rgb 0 77 150);  OnAccent = [Drawing.Color]::White
+  }
 }
 
 # --- gui ---------------------------------------------------------------------
@@ -1881,14 +1942,17 @@ function Show-Gui {
   $ctlW = $contentW - 32                           # a card inside a pane, 12px margins plus room for its border
   $form.StartPosition = 'CenterScreen'
 
-  $accent = [Drawing.Color]::FromArgb(10, 132, 255)   # brighter than the light-theme blue, for contrast on black
-  $ink    = [Drawing.Color]::FromArgb(240, 240, 242)
-  $muted  = [Drawing.Color]::FromArgb(150, 150, 158)
-  $line   = [Drawing.Color]::FromArgb(42, 42, 48)
-  $panel  = [Drawing.Color]::FromArgb(15, 15, 17)      # matte black, not pure black
-  $card   = [Drawing.Color]::FromArgb(24, 24, 27)      # panels sit one step above the ground
+  $dark   = Get-ThemeChoice
+  $global:TsakasPal = Get-Palette $dark
+  $pal    = $global:TsakasPal
+  $accent = $pal.Accent
+  $ink    = $pal.Ink
+  $muted  = $pal.Muted
+  $line   = $pal.Line
+  $panel  = $pal.Panel
+  $card   = $pal.Card
   $white  = [Drawing.Color]::White                     # only for text on the accent
-  $accentFill = [Drawing.Color]::FromArgb(0, 95, 184)  # white on this is 6.3:1; on $accent it is 3.7:1
+  $accentFill = $pal.AccentFill
   $form.BackColor = $panel
   $form.ForeColor = $ink
 
@@ -1910,16 +1974,16 @@ function Show-Gui {
   $display = & $pickFamily 'Segoe UI Variable Display Semib' (& $pickFamily 'Segoe UI Semibold' 'Segoe UI')
   $form.Font = New-Object Drawing.Font($family, 10)
 
-  $btnEdge = [Drawing.Color]::FromArgb(58, 58, 64)
+  $btnEdge = $pal.BtnEdge
   $flat = {
     param($b, $primary)
     $b.Cursor = 'Hand'
     $b.Height = 34
     if ($primary) {
       $b.Font = New-Object Drawing.Font($semi, 10)
-      Set-FluentButton $b $accentFill (Shift-Color $accentFill -18) $white $panel 6
+      Set-FluentButton $b 'AccentFill' 'AccentEdge' 'OnAccent' 'Panel' 6
     } else {
-      Set-FluentButton $b ([Drawing.Color]::FromArgb(33, 33, 38)) $btnEdge $ink $panel 6
+      Set-FluentButton $b 'BtnFill' 'BtnEdge' 'Ink' 'Panel' 6
     }
   }
 
@@ -1970,10 +2034,10 @@ function Show-Gui {
     }
 
     try {
-      $dark = 1
+      $titleDark = $(if ($dark) { 1 } else { 0 })
       $cap = [int]$panel.R -bor ([int]$panel.G -shl 8) -bor ([int]$panel.B -shl 16)
       $txt = [int]$ink.R -bor ([int]$ink.G -shl 8) -bor ([int]$ink.B -shl 16)
-      [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 20, [ref]$dark, 4)
+      [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 20, [ref]$titleDark, 4)
       [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 35, [ref]$cap, 4)
       [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 36, [ref]$txt, 4)
     } catch { }
@@ -2025,33 +2089,33 @@ function Show-Gui {
   $iconFont = if ($iconFamily) { New-Object Drawing.Font($iconFamily, 11) } else { $null }
   $navFont = New-Object Drawing.Font($family, 10)
   $navIcons = @([char]0xE9D9, [char]0xE964, [char]0xE950, [char]0xE968, [char]0xE8A9, [char]0xE713)
-  $navSelFill = [Drawing.Color]::FromArgb(38, 38, 44)
-  $navHoverFill = [Drawing.Color]::FromArgb(28, 28, 33)
+  $navSelFill = $pal.NavSel
+  $navHoverFill = $pal.NavHover
   $navState = New-Object psobject -Property @{ Selected = 0; Hover = -1 }
 
   $navPaint = {
     param($s, $e)
     $g = $e.Graphics
-    $g.Clear($panel)
+    $g.Clear($global:TsakasPal.Panel)
     $g.SmoothingMode = 'AntiAlias'
     $i = [int]$s.Tag
     $sel = ($navState.Selected -eq $i)
     if ($sel -or $navState.Hover -eq $i) {
       $r = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
       $p = New-RoundPath $r 6
-      $b = New-Object Drawing.SolidBrush($(if ($sel) { $navSelFill } else { $navHoverFill }))
+      $b = New-Object Drawing.SolidBrush($(if ($sel) { $global:TsakasPal.NavSel } else { $global:TsakasPal.NavHover }))
       $g.FillPath($b, $p); $b.Dispose(); $p.Dispose()
     }
     if ($sel) {
       $bar = New-Object Drawing.Rectangle(0, [int](($s.Height - (& $sc 16)) / 2), (& $sc 3), (& $sc 16))
       $bp = New-RoundPath $bar 1
-      $bb = New-Object Drawing.SolidBrush($accent)
+      $bb = New-Object Drawing.SolidBrush($global:TsakasPal.Accent)
       $g.FillPath($bb, $bp); $bb.Dispose(); $bp.Dispose()
     }
     if ($s.Focused) {
       $fr = New-Object Drawing.Rectangle(2, 2, ($s.Width - 5), ($s.Height - 5))
       $fp = New-RoundPath $fr 5
-      $fpen = New-Object Drawing.Pen($ink, 1)
+      $fpen = New-Object Drawing.Pen($global:TsakasPal.Ink, 1)
       $g.DrawPath($fpen, $fp)
       $fpen.Dispose(); $fp.Dispose()
     }
@@ -2059,11 +2123,11 @@ function Show-Gui {
     $textX = & $sc 14
     if ($iconFont) {
       $ir = New-Object Drawing.Rectangle((& $sc 14), 0, (& $sc 22), $s.Height)
-      [Windows.Forms.TextRenderer]::DrawText($g, [string]$navIcons[$i], $iconFont, $ir, $(if ($sel) { $accent } else { $ink }), $flags)
+      [Windows.Forms.TextRenderer]::DrawText($g, [string]$navIcons[$i], $iconFont, $ir, $(if ($sel) { $global:TsakasPal.Accent } else { $global:TsakasPal.Ink }), $flags)
       $textX = & $sc 44
     }
     $tr = New-Object Drawing.Rectangle($textX, 0, ($s.Width - $textX - (& $sc 6)), $s.Height)
-    [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $navFont, $tr, $ink, $flags)
+    [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $navFont, $tr, $global:TsakasPal.Ink, $flags)
   }.GetNewClosure()
   $navFocus = { param($s, $e) $s.Invalidate() }.GetNewClosure()
   $navEnter = { param($s, $e) $navState.Hover = [int]$s.Tag; $s.Invalidate() }.GetNewClosure()
@@ -2137,6 +2201,66 @@ function Show-Gui {
     $navs   += $nav
     $bodies += $body
   }
+  # Sun or moon, whichever one you are not in, at the foot of the sidebar.
+  $themeBtn = New-Object Windows.Forms.Button
+  $themeBtn.Size = New-Object Drawing.Size(200, 44)
+  $themeBtn.Location = New-Object Drawing.Point(14, ($contentH - 62))
+  $themeBtn.Anchor = 'Bottom,Left'
+  $themeBtn.Text = ''
+  $themeBtn.Cursor = 'Hand'
+  Set-FluentButton $themeBtn 'BtnFill' 'Muted' 'Ink' 'Panel' 8
+  $side.Controls.Add($themeBtn)
+
+  $themeFont = $(if ($iconFamily) { New-Object Drawing.Font($iconFamily, 13) } else { New-Object Drawing.Font($semi, 12) })
+  $themeLabelFont = New-Object Drawing.Font($semi, 10.5)
+  $themeBtn.Add_Paint({
+    param($s2, $e)
+    # sun when you are in the dark, moon when you are in the light
+    $glyph = $(if ($iconFamily) { [string][char]$(if ($global:TsakasThemeDark) { 0xE706 } else { 0xE708 }) }
+               else { $(if ($global:TsakasThemeDark) { '*' } else { 'C' }) })
+    $label = $(if ($global:TsakasThemeDark) { 'Light mode' } else { 'Dark mode' })
+    $r = New-Object Drawing.Rectangle((& $sc 16), 0, (& $sc 26), $s2.Height)
+    [Windows.Forms.TextRenderer]::DrawText($e.Graphics, $glyph, $themeFont, $r, $global:TsakasPal.Accent,
+      [Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine, NoPadding')
+    $t = New-Object Drawing.Rectangle((& $sc 48), 0, ($s2.Width - (& $sc 54)), $s2.Height)
+    [Windows.Forms.TextRenderer]::DrawText($e.Graphics, $label, $themeLabelFont, $t, $global:TsakasPal.Ink,
+      [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, NoPadding')
+  }.GetNewClosure())
+
+  # Swap the palette under the running window. Painted parts read $global:TsakasPal, so
+  # they only need repainting; colours set as properties are remapped old to new.
+  $applyTheme = {
+    $old = $global:TsakasPal
+    $global:TsakasThemeDark = -not $global:TsakasThemeDark
+    $global:TsakasPal = Get-Palette $global:TsakasThemeDark
+    try { Save-ThemeChoice $global:TsakasThemeDark } catch { }
+
+    # Several roles share a colour - in light mode Card, BtnFill and OnAccent are
+    # all white - so the first role in this order wins the mapping.
+    $order = @('Panel', 'Card', 'Section', 'Ink', 'Muted', 'Line', 'Accent', 'AccentFill',
+               'AccentEdge', 'BtnFill', 'BtnEdge', 'NavSel', 'NavHover', 'BarThumb', 'BarHot', 'OnAccent')
+    $map = @{}
+    foreach ($k in $order) {
+      if (-not $old.ContainsKey($k)) { continue }
+      $key = $old[$k].ToArgb()
+      if (-not $map.ContainsKey($key)) { $map[$key] = $global:TsakasPal[$k] }
+    }
+    $recolour = {
+      param($c)
+      if ($map.ContainsKey($c.BackColor.ToArgb())) { $c.BackColor = $map[$c.BackColor.ToArgb()] }
+      if ($map.ContainsKey($c.ForeColor.ToArgb())) { $c.ForeColor = $map[$c.ForeColor.ToArgb()] }
+      foreach ($kid in $c.Controls) { & $recolour $kid }
+    }
+    & $recolour $form
+
+    & $buildChecks
+    & $applyNative
+    & $fillList                    # the section rows carry their own colours
+    $form.Refresh()
+  }
+
+  $themeBtn.Add_Click({ & $applyTheme })
+
   # every pane puts its buttons on the same baseline, measured from its own height
   $bodyH   = $bodies[0].Height
   $btnRowY = $bodyH - 42          # button row
@@ -2198,7 +2322,6 @@ function Show-Gui {
     [pscustomobject]@{ Title = 'Disabled services';   Open = $false
       Match = { param($f) $f.Confidence -eq 'Leave' -and $f.Type -eq 'Service' -and $f.Mode -eq 'Disabled' } }
   )
-  $sectionFill = [Drawing.Color]::FromArgb(31, 31, 37)
   $chevronOpen = [string][char]0x25BE      # a filled triangle, which the text font has
   $chevronShut = [string][char]0x25B8
 
@@ -2217,8 +2340,8 @@ function Show-Gui {
         $(if ($sec.Open) { $chevronOpen } else { $chevronShut }), $sec.Title, $mine.Count))
       [void]$head.SubItems.Add('')
       [void]$head.SubItems.Add('')
-      $head.BackColor = $sectionFill
-      $head.ForeColor = $ink
+      $head.BackColor = $global:TsakasPal.Section
+      $head.ForeColor = $global:TsakasPal.Ink
       $head.Font = New-Object Drawing.Font($semi, 10)
       $head.Tag = $sec
       [void]$lv.Items.Add($head)
@@ -2380,10 +2503,9 @@ function Show-Gui {
   $footer.Size = New-Object Drawing.Size($form.ClientSize.Width, $footerH)
   $footer.Anchor = 'Left,Right,Bottom'
   $footer.BackColor = $panel
-  $footerLine = $line
   $footer.Add_Paint({
     param($s, $e)
-    $pen = New-Object Drawing.Pen($footerLine, 1)
+    $pen = New-Object Drawing.Pen($global:TsakasPal.Line, 1)
     $e.Graphics.DrawLine($pen, 0, 0, $s.Width, 0)
     $pen.Dispose()
   }.GetNewClosure())
@@ -2801,27 +2923,27 @@ function Show-Gui {
   $togglePaint = {
     param($s, $e)
     $g = $e.Graphics
-    $g.Clear($card)
+    $g.Clear($global:TsakasPal.Card)
     $g.SmoothingMode = 'AntiAlias'
     $on = [bool]$s.Tag
     $track = New-Object Drawing.Rectangle(0, (& $sc 2), ($s.Width - 1), ($s.Height - (& $sc 5)))
     $path = New-RoundPath $track ([int]($track.Height / 2))
     if ($on) {
-      $b = New-Object Drawing.SolidBrush($accentFill)
+      $b = New-Object Drawing.SolidBrush($global:TsakasPal.AccentFill)
       $g.FillPath($b, $path); $b.Dispose()
     } else {
-      $pen = New-Object Drawing.Pen($muted, 1)
+      $pen = New-Object Drawing.Pen($global:TsakasPal.Muted, 1)
       $g.DrawPath($pen, $path); $pen.Dispose()
     }
     $inset = & $sc 5
     $knob = $track.Height - 2 * $inset
     $kx = $(if ($on) { $track.Right - $knob - $inset } else { $track.Left + $inset })
-    $kb = New-Object Drawing.SolidBrush($(if ($on) { $white } else { $muted }))
+    $kb = New-Object Drawing.SolidBrush($(if ($on) { $global:TsakasPal.OnAccent } else { $global:TsakasPal.Muted }))
     $g.FillEllipse($kb, $kx, ($track.Top + $inset), $knob, $knob); $kb.Dispose()
     if ($s.Focused) {
       $fr = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
       $fp = New-RoundPath $fr ([int]($s.Height / 2))
-      $fpen = New-Object Drawing.Pen($ink, 1)
+      $fpen = New-Object Drawing.Pen($global:TsakasPal.Ink, 1)
       $g.DrawPath($fpen, $fp); $fpen.Dispose(); $fp.Dispose()
     }
     $path.Dispose()
@@ -2957,34 +3079,37 @@ function Show-Gui {
     $t.Font = New-Object Drawing.Font($family, 10)
   }
   $details.ForeColor = $muted
-  $detailsCard = Add-PaddedCard $details 10 $line 8 $card
-  $mtextCard   = Add-PaddedCard $mtext   10 $line 14 $card
-  $btextCard   = Add-PaddedCard $btext   10 $line 14 $card
-  $ntextCard   = Add-PaddedCard $ntext   10 $line 14 $card
-  $atextCard   = Add-PaddedCard $atext   10 $line 14 $card
+  $detailsCard = Add-PaddedCard $details 10 'Line' 8 $card
+  $mtextCard   = Add-PaddedCard $mtext   10 'Line' 14 $card
+  $btextCard   = Add-PaddedCard $btext   10 'Line' 14 $card
+  $ntextCard   = Add-PaddedCard $ntext   10 'Line' 14 $card
+  $atextCard   = Add-PaddedCard $atext   10 'Line' 14 $card
   foreach ($c in @($lv, $mlv, $blv, $nlv, $alv)) {
     Set-Rounded $c 10
-    Add-Hairline $c $line 10
+    Add-Hairline $c 'Line' 10
   }
 
   $headerFont = New-Object Drawing.Font($small, 9)
   $drawHeader = {
     param($s, $e)
     $g = $e.Graphics
-    $b = New-Object Drawing.SolidBrush($card)
+    $b = New-Object Drawing.SolidBrush($global:TsakasPal.Card)
     $g.FillRectangle($b, $e.Bounds); $b.Dispose()
-    $pen = New-Object Drawing.Pen($line, 1)
+    $pen = New-Object Drawing.Pen($global:TsakasPal.Line, 1)
     $g.DrawLine($pen, $e.Bounds.Left, ($e.Bounds.Bottom - 1), $e.Bounds.Right, ($e.Bounds.Bottom - 1)); $pen.Dispose()
     $r = New-Object Drawing.Rectangle(($e.Bounds.X + (& $sc 8)), $e.Bounds.Y, [Math]::Max(0, $e.Bounds.Width - (& $sc 12)), $e.Bounds.Height)
-    [Windows.Forms.TextRenderer]::DrawText($g, $e.Header.Text, $headerFont, $r, $muted,
+    [Windows.Forms.TextRenderer]::DrawText($g, $e.Header.Text, $headerFont, $r, $global:TsakasPal.Muted,
       [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, EndEllipsis')
   }.GetNewClosure()
   # the native checkbox stays white on a dark row; a state image list replaces
   # both glyphs, which is the only hook WinForms gives for them
-  $checkImages = New-Object Windows.Forms.ImageList
   $cbSize = & $sc 19
-  $checkImages.ImageSize = New-Object Drawing.Size($cbSize, $cbSize)
-  $checkImages.ColorDepth = 'Depth32Bit'
+  # a fresh list each time: clearing one that is already attached to a ListView
+  # leaves it refusing new images
+  $buildChecks = {
+  $imgs = New-Object Windows.Forms.ImageList
+  $imgs.ImageSize = New-Object Drawing.Size($cbSize, $cbSize)
+  $imgs.ColorDepth = 'Depth32Bit'
   foreach ($on in @($false, $true)) {
     $bmp = New-Object Drawing.Bitmap($cbSize, $cbSize)
     $g = [Drawing.Graphics]::FromImage($bmp)
@@ -3006,8 +3131,12 @@ function Show-Gui {
       $pen.Dispose()
     }
     $g.Dispose()
-    $checkImages.Images.Add($bmp)
+    $imgs.Images.Add($bmp)
   }
+  $global:TsakasChecks = $imgs
+  foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { if ($l.CheckBoxes) { $l.StateImageList = $imgs } }
+  }
+  & $buildChecks
 
   # one column takes whatever width is left - the last one, or the one the list
   # named in its Tag
@@ -3026,12 +3155,44 @@ function Show-Gui {
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
     foreach ($col in $l.Columns) { $col.Width = & $sc $col.Width }
     $l.OwnerDraw = $true
-    if ($l.CheckBoxes) { $l.StateImageList = $checkImages }
     $l.Add_DrawColumnHeader($drawHeader)
     $l.Add_DrawItem({ param($s, $e) $e.DrawDefault = $true })
     $l.Add_DrawSubItem({ param($s, $e) $e.DrawDefault = $true })
     $l.Add_Resize($fillLast)
     & $fillLast $l $null
+  }
+
+  # Everything Windows itself paints: list rows, list headers, the title bar.
+  # Called once when the window is built and again whenever the theme changes.
+  $applyNative = {
+    if (-not ('TsakasNative' -as [type])) { return }
+    $isDark = $global:TsakasThemeDark
+    try {
+      # 2 forces dark, 3 forces light; the process remembers this, so it has to
+      # be set either way, not only for dark
+      [void][TsakasNative]::SetPreferredAppMode($(if ($isDark) { 2 } else { 3 }))
+      [TsakasNative]::RefreshImmersiveColorPolicyState()
+    } catch { }
+    foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
+      if (-not $l.IsHandleCreated) { continue }
+      [void][TsakasNative]::SetWindowTheme($l.Handle, $(if ($isDark) { 'DarkMode_Explorer' } else { 'Explorer' }), $null)
+      # the header is its own window, and keeps its own colours unless themed too
+      $hdr = [TsakasNative]::SendMessage($l.Handle, 0x101F, [IntPtr]::Zero, [IntPtr]::Zero)   # LVM_GETHEADER
+      if ($hdr -ne [IntPtr]::Zero) { [void][TsakasNative]::SetWindowTheme($hdr, $(if ($isDark) { 'DarkMode_ItemsView' } else { 'ItemsView' }), $null) }
+    }
+    if ($setList.IsHandleCreated) {
+      [void][TsakasNative]::SetWindowTheme($setList.Handle, $(if ($isDark) { 'DarkMode_Explorer' } else { 'Explorer' }), $null)
+    }
+    if ($form.IsHandleCreated) {
+      $ref = { param($c) [int]$c.R -bor ([int]$c.G -shl 8) -bor ([int]$c.B -shl 16) }
+      $titleDark = $(if ($isDark) { 1 } else { 0 })
+      $caption = & $ref $global:TsakasPal.Panel
+      $captionText = & $ref $global:TsakasPal.Ink
+      # 20 dark title bar (so the window buttons invert), 35 caption colour, 36 caption text
+      [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 20, [ref]$titleDark, 4)
+      [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 35, [ref]$caption, 4)
+      [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 36, [ref]$captionText, 4)
+    }
   }
 
   # Windows 11 touches: Explorer-style list rows, and a title bar the same colour
@@ -3082,33 +3243,16 @@ public static class TsakasNative {
 '@
     }
     # 2 = force dark; this is what actually darkens checkboxes and scrollbars
-    try { [void][TsakasNative]::SetPreferredAppMode(2); [TsakasNative]::RefreshImmersiveColorPolicyState() } catch { }
-    # the settings rows scroll in a plain panel, whose scrollbar is light by default
-    [void][TsakasNative]::SetWindowTheme($setList.Handle, 'DarkMode_Explorer', $null)
-    foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
-      [TsakasScroll]::Attach($l)
-      [void][TsakasNative]::SetWindowTheme($l.Handle, 'DarkMode_Explorer', $null)
-      # the header is its own window, and keeps a light background unless themed too
-      $hdr = [TsakasNative]::SendMessage($l.Handle, 0x101F, [IntPtr]::Zero, [IntPtr]::Zero)   # LVM_GETHEADER
-      if ($hdr -ne [IntPtr]::Zero) { [void][TsakasNative]::SetWindowTheme($hdr, 'DarkMode_ItemsView', $null) }
-    }
-    $colorRef = { param($c) [int]$c.R -bor ([int]$c.G -shl 8) -bor ([int]$c.B -shl 16) }
-    $caption = & $colorRef $panel
-    $captionText = & $colorRef $ink
+    foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) { [TsakasScroll]::Attach($l) }
+    & $applyNative
     $round = 2
-    $dark = 1
-    # 20 dark title bar (so the window buttons invert), 35 caption colour,
-    # 36 caption text, 33 corner preference - Windows 11 only, ignored elsewhere
-    [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 20, [ref]$dark, 4)
-    [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 35, [ref]$caption, 4)
-    [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 36, [ref]$captionText, 4)
     [void][TsakasNative]::DwmSetWindowAttribute($form.Handle, 33, [ref]$round, 4)
   } catch { }
 
   # slim scrollbars for every list and report pane
   $barTrack = $card
-  $barThumb = [Drawing.Color]::FromArgb(125, 125, 133)
-  $barHot   = [Drawing.Color]::FromArgb(168, 168, 178)
+  $barThumb = $pal.BarThumb
+  $barHot   = $pal.BarHot
   # A list sized to its rows needs no scrollbar at all. It only grows to a share
   # of the page, so a long list still scrolls rather than pushing the report out.
   $fitList = {
@@ -3127,7 +3271,7 @@ public static class TsakasNative {
 
   $bars = @{}
   foreach ($c in @($lv, $mlv, $blv, $nlv, $alv, $mtext, $btext, $ntext, $atext)) {
-    $bars[$c] = Add-SlimScrollbar $c $barTrack $barThumb $barHot $dpiScale
+    $bars[$c] = Add-SlimScrollbar $c 'Card' 'BarThumb' 'BarHot' $dpiScale
   }
   & $fitList $mlv $mtextCard 0.4        # memory loaded before the bars existed
   foreach ($c in @($bars.Keys)) {
@@ -3159,7 +3303,14 @@ public static class TsakasNative {
     $btnElev.Top  = $btnApply.Top
   }.GetNewClosure())
 
+  # a theme switch reopens the window, so the timers of the old one stop here
+  $form.Add_FormClosed({
+    $barTimer.Stop()
+    $timer.Stop()
+  })
+
   [void]$form.ShowDialog()
+  $form.Dispose()
 }
 
 # --- self test ---------------------------------------------------------------
@@ -3327,4 +3478,5 @@ if (-not $SelfTest -and -not (Test-Admin) -and $PSCommandPath) {
 }
 
 if ($SelfTest) { Invoke-SelfTest; return }
+
 Show-Gui
