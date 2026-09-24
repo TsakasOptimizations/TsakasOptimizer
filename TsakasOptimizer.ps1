@@ -1889,7 +1889,7 @@ function Get-Palette([bool]$Dark) {
       Accent = (& $rgb 10 132 255);  AccentFill = (& $rgb 0 95 184)
       Ink    = (& $rgb 240 240 242); Muted   = (& $rgb 150 150 158)
       Line   = (& $rgb 42 42 48);    Panel   = (& $rgb 15 15 17)
-      Card   = (& $rgb 24 24 27);    Section = (& $rgb 31 31 37)
+      Card   = (& $rgb 24 24 27);    Section = (& $rgb 48 48 57)
       BtnFill = (& $rgb 33 33 38);   BtnEdge = (& $rgb 58 58 64)
       NavSel  = (& $rgb 38 38 44);   NavHover = (& $rgb 28 28 33)
       BarThumb = (& $rgb 125 125 133); BarHot = (& $rgb 168 168 178)
@@ -1900,7 +1900,7 @@ function Get-Palette([bool]$Dark) {
     Accent = (& $rgb 0 95 184);    AccentFill = (& $rgb 0 95 184)
     Ink    = (& $rgb 22 22 26);    Muted   = (& $rgb 92 92 102)
     Line   = (& $rgb 220 220 227); Panel   = (& $rgb 243 243 245)
-    Card   = (& $rgb 255 255 255); Section = (& $rgb 236 236 240)
+    Card   = (& $rgb 255 255 255); Section = (& $rgb 218 218 228)
     BtnFill = (& $rgb 255 255 255); BtnEdge = (& $rgb 201 201 210)
     NavSel  = (& $rgb 227 227 234); NavHover = (& $rgb 237 237 241)
     BarThumb = (& $rgb 160 160 170); BarHot = (& $rgb 122 122 134)
@@ -2258,10 +2258,13 @@ function Show-Gui {
     }
     & $recolour $form
 
-    & $buildChecks
     & $applyNative
     & $fillList                    # the section rows carry their own colours
     $form.Refresh()
+    # the native theme pass clears a list's state images, and a rebuild only
+    # sticks once the window has finished with this message - same reason the
+    # tick glyphs are built again on Shown rather than while the form is built
+    $form.BeginInvoke([Action]{ & $buildChecks }) | Out-Null
   }
 
   $themeBtn.Add_Click({ & $applyTheme })
@@ -2347,7 +2350,7 @@ function Show-Gui {
       [void]$head.SubItems.Add('')
       $head.BackColor = $global:TsakasPal.Section
       $head.ForeColor = $global:TsakasPal.Ink
-      $head.Font = New-Object Drawing.Font($semi, 10)
+      $head.Font = New-Object Drawing.Font($semi, 10.5, [Drawing.FontStyle]::Bold)
       $head.Tag = $sec
       [void]$lv.Items.Add($head)
       $head.Checked = ($mine.Count -gt 0 -and @($mine | Where-Object { -not $_.Ticked }).Count -eq 0)
@@ -3117,6 +3120,9 @@ function Show-Gui {
   # a fresh list each time: clearing one that is already attached to a ListView
   # leaves it refusing new images
   $buildChecks = {
+  # the palette of the moment, not the one this window was built with: these are
+  # drawn again on every theme switch
+  $pal = $global:TsakasPal
   $imgs = New-Object Windows.Forms.ImageList
   $imgs.ImageSize = New-Object Drawing.Size($cbSize, $cbSize)
   $imgs.ColorDepth = 'Depth32Bit'
@@ -3126,17 +3132,17 @@ function Show-Gui {
     $g.SmoothingMode = 'AntiAlias'
     $g.ScaleTransform(($cbSize / 16), ($cbSize / 16))
     if ($on) {
-      $b = New-Object Drawing.SolidBrush($accentFill)
+      $b = New-Object Drawing.SolidBrush($pal.AccentFill)
       $g.FillRectangle($b, 2, 2, 12, 12)
       $b.Dispose()
-      $pen = New-Object Drawing.Pen($white, 1.7)
+      $pen = New-Object Drawing.Pen($pal.OnAccent, 1.7)
       $g.DrawLines($pen, @(
         (New-Object Drawing.PointF(4.5, 8.2)),
         (New-Object Drawing.PointF(7, 10.6)),
         (New-Object Drawing.PointF(11.5, 5.4))))
       $pen.Dispose()
     } else {
-      $pen = New-Object Drawing.Pen($muted, 1)
+      $pen = New-Object Drawing.Pen($pal.Muted, 1)
       $g.DrawRectangle($pen, 2, 2, 11, 11)
       $pen.Dispose()
     }
