@@ -1662,8 +1662,10 @@ function Set-FluentButton($Btn, [string]$Fill, [string]$Border, [string]$Fore, [
       $rpen.Dispose(); $rp.Dispose()
     }
 
-    $s.ForeColor = $global:TsakasPal[$Fore]
-    $textCol = if ($s.Enabled) { $s.ForeColor } else { [Drawing.Color]::FromArgb(150, $s.ForeColor) }
+    # reading the palette, not writing ForeColor: setting a property here
+    # invalidates the button, which paints again, forever
+    $foreCol = $global:TsakasPal[$Fore]
+    $textCol = if ($s.Enabled) { $foreCol } else { [Drawing.Color]::FromArgb(150, $foreCol) }
     [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $textCol,
       [Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine, EndEllipsis')
 
@@ -2384,17 +2386,17 @@ function Show-Gui {
   $tab1.Controls.Add($status)
 
   $mkButton = {
-    param($text, $x, $w)
+    param($text, $x, $w, $primary)
     $b = New-Object Windows.Forms.Button
     $b.Text = $text
     $b.Location = New-Object Drawing.Point($x, $btnRowY)
     $b.Size = New-Object Drawing.Size($w, 30)
     $b.Anchor = 'Left,Bottom'
-    & $flat $b $false
+    & $flat $b $primary
     $tab1.Controls.Add($b)
     $b
   }
-  $btnApply   = & $mkButton 'Apply selected' 12  130
+  $btnApply   = & $mkButton 'Apply selected' 12  130 $true
   $btnRefresh = & $mkButton 'Rescan'         150 90
   $btnElev    = & $mkButton 'Restart app as admin' 256 160
 
@@ -2443,7 +2445,6 @@ function Show-Gui {
     $want = $(if ($over) { 'Hand' } else { 'Default' })
     if ("$($s.Cursor)" -ne "$want") { $s.Cursor = $want }
   }.GetNewClosure())
-  & $flat $btnApply $true
   $btnElev.Visible = -not (Test-Admin)
   $btnElev.Anchor = 'Bottom,Right'
   $btnElev.Location = New-Object Drawing.Point(($tab1.ClientSize.Width - $btnElev.Width - 12), $btnRowY)
@@ -3468,21 +3469,27 @@ function Invoke-SelfTest {
     @{N = 'Corsair part number gives CL36';       R = ((Get-PartTimings 'CMK32GX5M2B6000C36').CL -eq 36)}
     @{N = 'unknown part number gives no CL';      R = ($null -eq (Get-PartTimings 'NO-SUCH-PART').CL)}
     @{N = 'reads this PC without error';          R = ((@(Get-Dimms)).Count -ge 0)}
-    # $fill and $Fill are one variable: a local like that silently replaces the
-    # parameter, and anything reading the parameter later gets the wrong thing
-    @{N = 'no local overwrites a parameter';      R = (& {
+    # Setting a property on the control being painted invalidates it, so it
+    # paints again and never stops - and every other control waiting for its
+    # first paint stays blank.
+    @{N = 'no painter writes to what it paints'; R = (& {
         if (-not $PSCommandPath) { return $true }
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
-        $clash = 0
-        foreach ($fn in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-          $names = @($fn.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-          if (-not $names) { continue }
-          $set = @($fn.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
-            ForEach-Object { $_.Left } | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } |
-            ForEach-Object { $_.VariablePath.UserPath })
-          foreach ($n in $names) { foreach ($a in $set) { if (($a -cne $n) -and ($a -ieq $n)) { $clash++ } } }
+        $bad = 0
+        foreach ($call in $ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member)" -eq 'Add_Paint' }, $true)) {
+          # the handler is usually wrapped in .GetNewClosure(), so look inside
+          $block = @($call.Arguments | ForEach-Object {
+            $_.Find({ param($n) $n -is [System.Management.Automation.Language.ScriptBlockExpressionAst] }, $true) })[0]
+          if (-not $block) { continue }
+          $sender = @($block.ScriptBlock.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })[0]
+          if (-not $sender) { continue }
+          $bad += @($block.ScriptBlock.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+            Where-Object { $_.Left -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                           $_.Left.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                           $_.Left.Expression.VariablePath.UserPath -ieq $sender }).Count
         }
-        $clash -eq 0
+        $bad -eq 0
       })}
   )
   $bad = 0
