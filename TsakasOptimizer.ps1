@@ -24,7 +24,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.6'
+$Version = '13.1.7'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -1630,23 +1630,26 @@ function Set-FluentButton($Btn, [string]$Fill, [string]$Border, [string]$Fore, [
   $Btn.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
-    $bg = $global:TsakasPal[$Bg]
-    $fill = $global:TsakasPal[$Fill]
-    $border = $global:TsakasPal[$Border]
-    $g.Clear($bg)
+    # names that differ from the parameters only in case would overwrite them:
+    # PowerShell has one $fill and $Fill, and the second paint would then look
+    # up a colour as a palette key and find nothing
+    $bgCol = $global:TsakasPal[$Bg]
+    $fillCol = $global:TsakasPal[$Fill]
+    $edgeCol = $global:TsakasPal[$Border]
+    $g.Clear($bgCol)
     $g.SmoothingMode = 'AntiAlias'
     $rect = New-Object Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
     $path = New-RoundPath $rect $Radius
 
     # a light fill darkens on hover, a dark one lightens
-    $light = ([int]$fill.R + $fill.G + $fill.B) -gt 600
-    $f = $fill
-    if ($state.Down)    { $f = Shift-Color $fill $(if ($light) { -14 } else { -18 }) }
-    elseif ($state.Hot) { $f = Shift-Color $fill $(if ($light) { -6 } else { 14 }) }
+    $light = ([int]$fillCol.R + $fillCol.G + $fillCol.B) -gt 600
+    $f = $fillCol
+    if ($state.Down)    { $f = Shift-Color $fillCol $(if ($light) { -14 } else { -18 }) }
+    elseif ($state.Hot) { $f = Shift-Color $fillCol $(if ($light) { -6 } else { 14 }) }
     $brush = New-Object Drawing.SolidBrush($f)
     $g.FillPath($brush, $path)
 
-    $edge = New-Object Drawing.Drawing2D.LinearGradientBrush($rect, $border, (Shift-Color $border -26), 90)
+    $edge = New-Object Drawing.Drawing2D.LinearGradientBrush($rect, $edgeCol, (Shift-Color $edgeCol -26), 90)
     $pen = New-Object Drawing.Pen($edge, 1)
     $g.DrawPath($pen, $path)
 
@@ -1660,8 +1663,8 @@ function Set-FluentButton($Btn, [string]$Fill, [string]$Border, [string]$Fore, [
     }
 
     $s.ForeColor = $global:TsakasPal[$Fore]
-    $fore = if ($s.Enabled) { $s.ForeColor } else { [Drawing.Color]::FromArgb(150, $s.ForeColor) }
-    [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $fore,
+    $textCol = if ($s.Enabled) { $s.ForeColor } else { [Drawing.Color]::FromArgb(150, $s.ForeColor) }
+    [Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $textCol,
       [Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine, EndEllipsis')
 
     $brush.Dispose(); $edge.Dispose(); $pen.Dispose(); $path.Dispose()
@@ -2370,7 +2373,7 @@ function Show-Gui {
   $details.Anchor = 'Left,Right,Bottom'
   $details.BorderStyle = 'FixedSingle'
   $details.ForeColor = $muted
-  $details.Text = 'Everything running on this PC, by category. Do not know what something is? Click the information mark after its name, or double-click the row, to look it up.'
+  $details.Text = 'Everything running on this PC, by category. Do not know what something is? Click the information mark after its name to look it up.'
   $tab1.Controls.Add($details)
 
   $status = New-Object Windows.Forms.Label
@@ -2402,12 +2405,6 @@ function Show-Gui {
     $what = $(if ($f.Type -eq 'Service') { "{0} service" -f $f.Label } else { "{0}.exe process" -f $f.Name })
     Start-Process ("https://www.google.com/search?q=" + [Uri]::EscapeDataString("what is $what windows"))
   }
-  $lv.Add_DoubleClick({
-    if ($lv.SelectedItems.Count -eq 0) { return }
-    $tag = $lv.SelectedItems[0].Tag
-    if ($tag -and $tag.PSObject.Properties.Name -notcontains 'Match') { & $searchRow $tag }
-  })
-
   # An information mark after every row's name. The rows themselves are drawn by
   # Windows, so this paints over them once they are down, and the same geometry
   # decides what a click landed on.
@@ -2470,6 +2467,18 @@ function Show-Gui {
   }
   & $refresh
 
+  # Windows only ticks a row when the 13px box itself is hit. Anywhere on the
+  # row does it here - except the box (Windows already toggled it) and the
+  # information mark, which is a link.
+  $widenTick = {
+    param($s, $e)
+    $hit = $s.GetItemAt($e.X, $e.Y)
+    if (-not $hit) { return }
+    if ($hit.Tag -and $hit.Tag.PSObject.Properties.Name -contains 'Match') { return }
+    if ("$($s.HitTest($e.X, $e.Y).Location)" -match 'StateImage') { return }
+    if ($s -eq $lv -and (& $infoRect $hit).Contains($e.Location)) { return }
+    $hit.Checked = -not $hit.Checked
+  }
   $lv.Add_ItemCheck({
     param($s, $e)
     if ($script:filling) { return }
@@ -3103,7 +3112,7 @@ function Show-Gui {
   }.GetNewClosure()
   # the native checkbox stays white on a dark row; a state image list replaces
   # both glyphs, which is the only hook WinForms gives for them
-  $cbSize = & $sc 19
+  $cbSize = & $sc 26
   # a fresh list each time: clearing one that is already attached to a ListView
   # leaves it refusing new images
   $buildChecks = {
@@ -3114,7 +3123,7 @@ function Show-Gui {
     $bmp = New-Object Drawing.Bitmap($cbSize, $cbSize)
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = 'AntiAlias'
-    $g.ScaleTransform(($dpiScale * 19 / 16), ($dpiScale * 19 / 16))
+    $g.ScaleTransform(($cbSize / 16), ($cbSize / 16))
     if ($on) {
       $b = New-Object Drawing.SolidBrush($accentFill)
       $g.FillRectangle($b, 2, 2, 12, 12)
@@ -3154,6 +3163,7 @@ function Show-Gui {
   }
   foreach ($l in @($lv, $mlv, $blv, $nlv, $alv)) {
     foreach ($col in $l.Columns) { $col.Width = & $sc $col.Width }
+    if ($l.CheckBoxes) { $l.Add_MouseDown($widenTick) }   # every list is built by now
     $l.OwnerDraw = $true
     $l.Add_DrawColumnHeader($drawHeader)
     $l.Add_DrawItem({ param($s, $e) $e.DrawDefault = $true })
@@ -3301,6 +3311,9 @@ public static class TsakasNative {
   $form.Add_Shown({
     $btnElev.Left = $tab1.ClientSize.Width - $btnElev.Width - (& $sc 12)
     $btnElev.Top  = $btnApply.Top
+    # the lists size their tick box when their window is created, so a list
+    # handed the images before that keeps Windows' own 13px one
+    & $buildChecks
   }.GetNewClosure())
 
   # a theme switch reopens the window, so the timers of the old one stop here
@@ -3455,6 +3468,22 @@ function Invoke-SelfTest {
     @{N = 'Corsair part number gives CL36';       R = ((Get-PartTimings 'CMK32GX5M2B6000C36').CL -eq 36)}
     @{N = 'unknown part number gives no CL';      R = ($null -eq (Get-PartTimings 'NO-SUCH-PART').CL)}
     @{N = 'reads this PC without error';          R = ((@(Get-Dimms)).Count -ge 0)}
+    # $fill and $Fill are one variable: a local like that silently replaces the
+    # parameter, and anything reading the parameter later gets the wrong thing
+    @{N = 'no local overwrites a parameter';      R = (& {
+        if (-not $PSCommandPath) { return $true }
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
+        $clash = 0
+        foreach ($fn in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+          $names = @($fn.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+          if (-not $names) { continue }
+          $set = @($fn.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+            ForEach-Object { $_.Left } | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } |
+            ForEach-Object { $_.VariablePath.UserPath })
+          foreach ($n in $names) { foreach ($a in $set) { if (($a -cne $n) -and ($a -ieq $n)) { $clash++ } } }
+        }
+        $clash -eq 0
+      })}
   )
   $bad = 0
   foreach ($c in $checks) {
