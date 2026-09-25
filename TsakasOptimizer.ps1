@@ -24,7 +24,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.9'
+$Version = '13.1.10'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -2260,6 +2260,7 @@ function Show-Gui {
 
     & $applyNative
     & $fillList                    # the section rows carry their own colours
+    if ($script:appLoaded) { & $fillApps }
     $form.Refresh()
     # the native theme pass clears a list's state images, and a rebuild only
     # sticks once the window has finished with this message - same reason the
@@ -2286,12 +2287,16 @@ function Show-Gui {
     $navState.Selected = $index
     foreach ($n in $navs) { $n.Invalidate() }
     $form.Cursor = 'WaitCursor'
+    $first = $false
     try {
-      if ($index -eq 2 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true }
-      if ($index -eq 3 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true }
-      if ($index -eq 4 -and -not $script:appLoaded)   { & $loadApps;  $script:appLoaded  = $true }
+      if ($index -eq 2 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true; $first = $true }
+      if ($index -eq 3 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true; $first = $true }
+      if ($index -eq 4 -and -not $script:appLoaded)   { & $loadApps;  $script:appLoaded  = $true; $first = $true }
       if ($index -eq 5) { & $loadSettings }
     } finally { $form.Cursor = 'Default' }
+    # a list gets its tick glyphs only once its own window exists, and these pages
+    # are built while they are hidden - so the first time one is opened, again
+    if ($first) { $form.BeginInvoke([Action]{ & $buildChecks }) | Out-Null }
   }
   foreach ($n in $navs) { $n.Add_Click({ param($s, $e) & $selectSection ([int]$s.Tag) }) }
 
@@ -2311,8 +2316,10 @@ function Show-Gui {
   $lv.BorderStyle = 'FixedSingle'
   $lv.BackColor = $card
   [void]$lv.Columns.Add('App Name', 330)
+  [void]$lv.Columns.Add('Info', 46)
   [void]$lv.Columns.Add('Type', 70)
   [void]$lv.Columns.Add('RAM', 90)
+  $lv.Columns[1].TextAlign = 'Center'
   $lv.Tag = 0                       # the name column is the one that stretches
 
   # Sections are rows, not ListView groups. Groups draw their own header in
@@ -2348,6 +2355,7 @@ function Show-Gui {
         $(if ($sec.Open) { $chevronOpen } else { $chevronShut }), $sec.Title, $mine.Count))
       [void]$head.SubItems.Add('')
       [void]$head.SubItems.Add('')
+      [void]$head.SubItems.Add('')
       $head.BackColor = $global:TsakasPal.Section
       $head.ForeColor = $global:TsakasPal.Ink
       $head.Font = New-Object Drawing.Font($semi, 10.5, [Drawing.FontStyle]::Bold)
@@ -2356,7 +2364,11 @@ function Show-Gui {
       $head.Checked = ($mine.Count -gt 0 -and @($mine | Where-Object { -not $_.Ticked }).Count -eq 0)
       if (-not $sec.Open) { continue }
       foreach ($f in $mine) {
-        $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }) + '   ' + $infoMark)
+        $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }))
+        $it.UseItemStyleForSubItems = $false     # or the mark takes the row's colour
+        $info = $it.SubItems.Add($infoMark)
+        $info.ForeColor = $global:TsakasPal.Accent
+        $info.Font = $infoFont
         [void]$it.SubItems.Add($f.Type)
         [void]$it.SubItems.Add($(if ($f.RamMB -gt 0) { '{0} MB' -f $f.RamMB } else { '-' }))
         $it.Tag = $f
@@ -2378,7 +2390,7 @@ function Show-Gui {
   $details.Anchor = 'Left,Right,Bottom'
   $details.BorderStyle = 'FixedSingle'
   $details.ForeColor = $muted
-  $details.Text = 'Everything running on this PC, by category. Do not know what something is? Click the information mark after its name to look it up.'
+  $details.Text = 'Everything running on this PC, by category. Do not know what something is? Click the blue mark in the Info column to look it up.'
   $tab1.Controls.Add($details)
 
   $status = New-Object Windows.Forms.Label
@@ -2410,24 +2422,19 @@ function Show-Gui {
     $what = $(if ($f.Type -eq 'Service') { "{0} service" -f $f.Label } else { "{0}.exe process" -f $f.Name })
     Start-Process ("https://www.google.com/search?q=" + [Uri]::EscapeDataString("what is $what windows"))
   }
-  # An information mark after every row's name. The rows themselves are drawn by
-  # Windows, so this paints over them once they are down, and the same geometry
-  # decides what a click landed on.
-  # The mark is part of the row's own text. Owner-drawing it is not possible here:
-  # the item's default pass paints the whole row, and anything a subitem handler
-  # draws over the name column is discarded.
-  $infoMark = [string][char]0x24D8          # circled i
-  $noPad = [Windows.Forms.TextFormatFlags]::NoPadding
+  # An information mark on every row, in its own column: a subitem carries its own
+  # colour and font, so it can read as a link, while the item's text is one colour
+  # for the whole row. Owner-drawing it next to the name is not possible here - the
+  # item's default pass paints the whole row and anything drawn over it is discarded.
+  # Segoe's own info glyph where the icon font exists, a circled i everywhere else
+  $infoMark = $(if ($iconFamily) { [string][char]0xE946 } else { [string][char]0x24D8 })
+  $infoFont = $(if ($iconFamily) { New-Object Drawing.Font($iconFamily, 12) }
+                else { New-Object Drawing.Font($family, 14) })
   $infoRect = {
     param($item)
-    $b = $item.GetBounds('Label')
-    $full = [Windows.Forms.TextRenderer]::MeasureText($item.Text, $lv.Font, $b.Size, $noPad).Width
-    $mark = [Windows.Forms.TextRenderer]::MeasureText($infoMark, $lv.Font, $b.Size, $noPad).Width
-    New-Object Drawing.Rectangle(($b.Left + $full - $mark - (& $sc 3)), $b.Top, ($mark + (& $sc 6)), $b.Height)
-  }.GetNewClosure()
-
-  # drawn while the second column is painted, which is after the name next to it
-  # is already on screen - a Paint handler would run before the rows and vanish
+    if ($item.SubItems.Count -lt 2) { return (New-Object Drawing.Rectangle(0, 0, 0, 0)) }
+    $item.SubItems[1].Bounds
+  }
   $lv.Add_MouseClick({
     param($s, $e)
     $hit = $s.GetItemAt($e.X, $e.Y)
@@ -2852,7 +2859,7 @@ function Show-Gui {
   $alv.Location = New-Object Drawing.Point(12, 12)
   $alv.Size = New-Object Drawing.Size($ctlW, 260)
   $alv.Anchor = 'Top,Left,Right'
-  foreach ($c in @(@('App', 240), @('Action', 90), @('Current state', 190), @('Result', 100), @('What it does', 300))) {
+  foreach ($c in @(@('App', 300), @('Action', 90), @('Current state', 190), @('Result', 100), @('What it does', 300))) {
     [void]$alv.Columns.Add($c[0], $c[1])
   }
   $tab5.Controls.Add($alv)
@@ -2873,20 +2880,56 @@ function Show-Gui {
   & $flat $btnApps $true
   $tab5.Controls.Add($btnApps)
 
-  $loadApps = {
+  # Categories as rows, the same as the first tab: Windows draws real list group
+  # headers in colours SetWindowTheme cannot reach.
+  $appSections = @(
+    [pscustomobject]@{ Title = 'Starts with Windows';       Open = $true
+      Match = { param($r) $r.Action -eq 'Startup' } }
+    [pscustomobject]@{ Title = 'Caches worth clearing';     Open = $true
+      Match = { param($r) $r.Action -eq 'Cache' } }
+    [pscustomobject]@{ Title = 'Store apps you can remove'; Open = $false
+      Match = { param($r) $r.Action -eq 'Uninstall' } }
+  )
+  $script:appRows = @()
+
+  $fillApps = {
+    $script:appFilling = $true            # setting Checked below raises ItemCheck
+    $alv.BeginUpdate()
     $alv.Items.Clear()
-    $rows = @(Get-AppFindings)
-    foreach ($r in $rows) {
-      $it = New-Object Windows.Forms.ListViewItem($r.App)
-      [void]$it.SubItems.Add($r.Action)
-      [void]$it.SubItems.Add($r.Status)
-      [void]$it.SubItems.Add($r.Target)
-      [void]$it.SubItems.Add($r.Effect)
-      $it.Tag = $r
-      [void]$alv.Items.Add($it)
+    foreach ($sec in $appSections) {
+      $mine = @($script:appRows | Where-Object { & $sec.Match $_ })
+      $head = New-Object Windows.Forms.ListViewItem(("{0}  {1}  ({2})" -f `
+        $(if ($sec.Open) { $chevronOpen } else { $chevronShut }), $sec.Title, $mine.Count))
+      for ($i = 1; $i -lt $alv.Columns.Count; $i++) { [void]$head.SubItems.Add('') }
+      $head.BackColor = $global:TsakasPal.Section
+      $head.ForeColor = $global:TsakasPal.Ink
+      $head.Font = New-Object Drawing.Font($semi, 10.5, [Drawing.FontStyle]::Bold)
+      $head.Tag = $sec
+      [void]$alv.Items.Add($head)
+      $head.Checked = ($mine.Count -gt 0 -and @($mine | Where-Object { -not $_.Ticked }).Count -eq 0)
+      if (-not $sec.Open) { continue }
+      foreach ($r in $mine) {
+        $it = New-Object Windows.Forms.ListViewItem($r.App)
+        [void]$it.SubItems.Add($r.Action)
+        [void]$it.SubItems.Add($r.Status)
+        [void]$it.SubItems.Add($r.Target)
+        [void]$it.SubItems.Add($r.Effect)
+        $it.Tag = $r
+        $it.Checked = [bool]$r.Ticked     # ticks survive a fold and a rescan
+        [void]$alv.Items.Add($it)
+      }
     }
+    $alv.EndUpdate()
+    $script:appFilling = $false
     if ($fitList) { & $fitList $alv $atextCard 0.45 }
-    if ($alv.Items.Count -eq 0) {
+  }
+
+  $loadApps = {
+    $rows = @(Get-AppFindings)
+    foreach ($r in $rows) { Add-Member -InputObject $r -NotePropertyName Ticked -NotePropertyValue $false -Force }
+    $script:appRows = $rows
+    & $fillApps
+    if ($rows.Count -eq 0) {
       $atext.Text = 'Nothing to offer: no startup entries, no cache worth clearing, no removable Store apps.'
     } else {
       $reclaim = ($rows | Measure-Object Bytes -Sum).Sum
@@ -2898,31 +2941,64 @@ function Show-Gui {
     }
   }
 
+  $alv.Add_MouseClick({
+    param($s, $e)
+    $hit = $s.GetItemAt($e.X, $e.Y)
+    if (-not $hit -or -not $hit.Tag) { return }
+    if ($hit.Tag.PSObject.Properties.Name -contains 'Match') {
+      $hit.Tag.Open = -not $hit.Tag.Open
+      & $fillApps
+    }
+  })
+
+  $alv.Add_MouseMove({
+    param($s, $e)
+    $hit = $s.GetItemAt($e.X, $e.Y)
+    $onHead = ($hit -and $hit.Tag -and $hit.Tag.PSObject.Properties.Name -contains 'Match')
+    $want = $(if ($onHead) { 'Hand' } else { 'Default' })
+    if ("$($s.Cursor)" -ne "$want") { $s.Cursor = $want }
+  })
+
+  $alv.Add_ItemCheck({
+    param($s, $e)
+    if ($script:appFilling) { return }
+    $tag = $alv.Items[$e.Index].Tag
+    if (-not $tag) { return }
+    $want = ($e.NewValue -eq 'Checked')
+    if ($tag.PSObject.Properties.Name -contains 'Match') {
+      foreach ($r in @($script:appRows | Where-Object { & $tag.Match $_ })) { $r.Ticked = $want }
+      $alv.BeginInvoke([Action]{ & $fillApps }) | Out-Null
+      return
+    }
+    $tag.Ticked = $want
+  })
+
   $alv.Add_ItemSelectionChanged({
     if ($alv.SelectedItems.Count -gt 0) {
       $r = $alv.SelectedItems[0].Tag
+      if (-not $r -or $r.PSObject.Properties.Name -contains 'Match') { return }
       $atext.Text = "$($r.Effect)`r`n`r`n$($r.Why)"
     }
   })
 
   $btnApps.Add_Click({
-    $items = @($alv.CheckedItems)
+    $items = @($script:appRows | Where-Object { $_.Ticked })
     if ($items.Count -eq 0) {
       [void](& $dialog 'Tick at least one row first.' 'TsakasOptimizer' 'OK')
       return
     }
-    $names = ($items | ForEach-Object { "$($_.Tag.App): $($_.Tag.Action)" }) -join "`r`n"
-    $gone = @($items | Where-Object { $_.Tag.Action -eq 'Uninstall' })
+    $names = ($items | ForEach-Object { "$($_.App): $($_.Action)" }) -join "`r`n"
+    $gone = @($items | Where-Object { $_.Action -eq 'Uninstall' })
     $warn = $(if ($gone.Count) {
       "`r`n`r`nWARNING: {0} of these are uninstalls ({1}). Removing an app cannot be undone by this tool - you would have to reinstall it from the Microsoft Store." -f `
-        $gone.Count, (($gone | ForEach-Object { $_.Tag.App }) -join ', ')
+        $gone.Count, (($gone | ForEach-Object { $_.App }) -join ', ')
     } else { '' })
     $ans = & $dialog "Apply these changes?`r`n`r`n$names$warn" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
     $done = 0; $errs = @()
-    foreach ($it in $items) {
-      try { Invoke-AppAction $it.Tag; $done++ }
-      catch { $errs += "$($it.Tag.App) $($it.Tag.Action): $($_.Exception.Message)" }
+    foreach ($r in $items) {
+      try { Invoke-AppAction $r; $done++ }
+      catch { $errs += "$($r.App) $($r.Action): $($_.Exception.Message)" }
     }
     & $loadApps
     $atext.Text = "Applied $done action(s).$(if ($errs) { "`r`n`r`nFailed:`r`n$($errs -join "`r`n")" } else { '' })"
