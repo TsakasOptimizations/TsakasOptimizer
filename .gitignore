@@ -1,3 +1,7 @@
 *.bak
-graphify-out/
 theme.txt
+
+# local tooling, not part of the app
+graphify-out/
+.claude/
+CLAUDE.md
