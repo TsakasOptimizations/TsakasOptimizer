@@ -870,6 +870,21 @@ function Get-NetGroup([string]$DisplayName) {
   return $null
 }
 
+# Kept on the adapter's power management object rather than the advanced
+# properties: the names there differ per vendor, these do not.
+$NetWakeFlags = @(
+  @{ Field = 'ArpOffload'; Label = 'ARP offload'
+     Why = 'Lets the card answer ARP for this PC while it sleeps, which keeps part of the adapter powered. Nothing needs it on a desktop that is either on or off.' }
+  @{ Field = 'NSOffload'; Label = 'IPv6 neighbour discovery offload'
+     Why = 'The IPv6 half of ARP offload: the card answers neighbour solicitations while the PC sleeps. Same trade.' }
+  @{ Field = 'WakeOnMagicPacket'; Label = 'Wake on magic packet'
+     Why = 'Lets another machine wake this PC over the network. Turn it off unless you actually use Wake-on-LAN.' }
+  @{ Field = 'WakeOnPattern'; Label = 'Wake on pattern match'
+     Why = 'Wakes the PC on ordinary network traffic, not just a wake packet. This is the usual reason a PC wakes up by itself during the night.' }
+  @{ Field = 'DeviceSleepOnDisconnect'; Label = 'Sleep when the cable is unplugged'
+     Why = 'Puts the adapter to sleep when the link drops, and it comes back slowly when the cable returns.' }
+)
+
 $NetWhy = @{
   'Energy-Efficient Ethernet' = 'Powers the link down between packets. Saves under a watt, and is a known cause of latency spikes and dropped links.'
   'Advanced EEE'              = 'Aggressive version of the same link power saving. Same trade, worse.'
@@ -910,8 +925,17 @@ function Get-NetFindings {
     if ($pm -and $pm.AllowComputerToTurnOffDevice -eq 'Enabled') {
       [void]$rows.Add([pscustomobject]@{
         Kind = 'Power'; Adapter = $a.Name; Setting = 'Allow the computer to turn off this device'
-        Current = 'Enabled'; Target = 'Disabled'; Group = 'Power saving'
+        Field = 'AllowComputerToTurnOffDevice'; Current = 'Enabled'; Target = 'Disabled'; Group = 'Power saving'
         Why = 'Windows may power the adapter down to save energy. This is the classic cause of "the internet drops after the PC has been idle".'
+      })
+    }
+    foreach ($w in $NetWakeFlags) {
+      # anything else it reports - Unsupported, NotSupported, Disabled - is nothing to offer
+      if (-not $pm -or "$($pm.($w.Field))" -ne 'Enabled') { continue }
+      [void]$rows.Add([pscustomobject]@{
+        Kind = 'Power'; Adapter = $a.Name; Setting = $w.Label
+        Field = $w.Field; Current = 'Enabled'; Target = 'Disabled'; Group = 'Wake and sleep (optional)'
+        Why = $w.Why
       })
     }
   }
@@ -926,7 +950,7 @@ function Get-NetFindings {
     })
   }
 
-  $order = @{ 'Repair' = 0; 'Power saving' = 1; 'Latency (optional)' = 2 }
+  $order = @{ 'Repair' = 0; 'Power saving' = 1; 'Latency (optional)' = 2; 'Wake and sleep (optional)' = 3 }
   $rows | Sort-Object { $order[$_.Group] }
 }
 
@@ -963,6 +987,33 @@ function Get-NetNotes {
       [void]$n.Add(("    [i] Buffers: receive {0}, transmit {1}. Lower only if chasing stutter - too low drops packets in bursts." -f $(if ($rb) { $rb } else { '-' }), $(if ($tb) { $tb } else { '-' })))
     }
   }
+  # System-wide TCP, read only. Nothing here is worth changing on a healthy
+  # machine, but it is where tweak guides do their damage, so it is reported.
+  $tcp = try { Get-NetTCPSetting -SettingName Internet -ErrorAction Stop } catch { $null }
+  if ($tcp) {
+    [void]$n.Add('')
+    [void]$n.Add('Windows TCP, every adapter:')
+    if ("$($tcp.AutoTuningLevelLocal)" -eq 'Normal') {
+      [void]$n.Add('    [ok] Receive window auto-tuning: Normal, the default.')
+    } else {
+      [void]$n.Add(("    [!] Receive window auto-tuning: {0}. A tweak-guide leftover that caps download speed on a fast line. Undo it with:  netsh int tcp set global autotuninglevel=normal" -f $tcp.AutoTuningLevelLocal))
+    }
+    [void]$n.Add(("    [i] ECN: {0}. Windows leaves this off, and it only helps when every hop on the path supports it." -f $tcp.EcnCapability))
+    [void]$n.Add(("    [i] TCP timestamps: {0}. Allowed is the default, and switching them off wins no latency." -f $tcp.Timestamps))
+  }
+
+  # RSC coalesces received TCP segments before the CPU sees them. It is a
+  # throughput feature and does nothing for the UDP games run on.
+  $rsc = @(try { Get-NetAdapterRsc -ErrorAction Stop } catch { @() })
+  if ($rsc.Count -eq 0) {
+    [void]$n.Add('    [i] Receive Segment Coalescing: not offered by this adapter or driver. Nothing to do.')
+  } else {
+    foreach ($r in $rsc) {
+      [void]$n.Add(("    [i] Receive Segment Coalescing on {0}: IPv4 {1}, IPv6 {2}. On is the default and costs nothing in a game." -f `
+        $r.Name, $(if ($r.IPv4Enabled) { 'on' } else { 'off' }), $(if ($r.IPv6Enabled) { 'on' } else { 'off' })))
+    }
+  }
+
   [void]$n.Add('')
   [void]$n.Add('Driver: take it from the chip maker (Intel, Realtek, Marvell), not the motherboard page. RSS often needs their latest.')
   [void]$n.Add('Latency options follow Microsoft''s network adapter performance tuning guide.')
@@ -980,7 +1031,7 @@ function Invoke-NetFix($Row) {
     Set-NetAdapterAdvancedProperty -Name $Row.Adapter -DisplayName $Row.Setting -DisplayValue $Row.Target -ErrorAction Stop
   } else {
     $pm = Get-NetAdapterPowerManagement -Name $Row.Adapter -ErrorAction Stop
-    $pm.AllowComputerToTurnOffDevice = 'Disabled'
+    $pm.($Row.Field) = 'Disabled'
     Set-NetAdapterPowerManagement -InputObject $pm -ErrorAction Stop
   }
 }
@@ -3491,7 +3542,9 @@ function Invoke-SelfTest {
     @{N = 'already-off setting is not flagged';   R = ($null -eq (Get-NetOffValue 'Green Ethernet' 'Disabled' @('Disabled','Enabled')))}
     @{N = 'EEE speed list is not a toggle';       R = ($null -eq (Get-NetOffValue 'EEE Max Support Speed' '2.5 Gbps Full Duplex' @('1.0 Gbps Full Duplex','2.5 Gbps Full Duplex')))}
     @{N = 'unrelated settings are left alone';    R = ($null -eq (Get-NetOffValue 'Jumbo Frame' 'Enabled' @('Disabled','Enabled')))}
-    @{N = 'wake-on-lan is left alone';            R = ($null -eq (Get-NetOffValue 'Wake on Magic Packet' 'Enabled' @('Disabled','Enabled')))}
+    @{N = 'wake-on-lan is not a property row';    R = ($null -eq (Get-NetOffValue 'Wake on Magic Packet' 'Enabled' @('Disabled','Enabled')))}
+    @{N = 'every wake flag is complete';          R = (@($NetWakeFlags | Where-Object { $_.Field -and $_.Label -and $_.Why }).Count -eq $NetWakeFlags.Count)}
+    @{N = 'wake flags do not repeat';             R = ((@($NetWakeFlags.Field | Sort-Object -Unique).Count -eq $NetWakeFlags.Count) -and ($NetWakeFlags.Field -notcontains 'AllowComputerToTurnOffDevice'))}
     @{N = 'Off counts as off';                    R = ($null -eq (Get-NetOffValue 'Power Saving Mode' 'Off' @('Off','On')))}
     @{N = 'interrupt moderation is offered';      R = ((Get-NetOffValue 'Interrupt Moderation' 'Enabled' @('Disabled','Enabled')) -eq 'Disabled')}
     @{N = 'moderation rate is not a toggle';      R = ($null -eq (Get-NetOffValue 'Interrupt Moderation Rate' 'Adaptive' @('Adaptive','Extreme','High','Low','Minimal','Off')))}
