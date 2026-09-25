@@ -24,7 +24,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.10'
+$Version = '13.1.11'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -2283,6 +2283,80 @@ function Show-Gui {
       [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, NoPadding')
   }.GetNewClosure())
 
+  # Shown while the window cannot answer. The scans run on the thread that paints,
+  # so nothing here can animate during them: it is painted once, before the call
+  # that blocks, and taken down afterwards. The bar only moves where the work is a
+  # loop the app drives itself, which is Apply.
+  # globals, not $script: - the painter below is a closure, and $script: inside
+  # one addresses the closure's own module instead of this file
+  $global:TsakasBusyValue = 0
+  $global:TsakasBusyMax = 0
+  $script:busyNow = $false
+  $busyCard = New-Object Windows.Forms.Panel
+  $busyCard.Size = New-Object Drawing.Size(360, 96)
+  $busyCard.Visible = $false
+  $busyFont = New-Object Drawing.Font($semi, 10.5)
+  $busyCard.Add_Paint({
+    param($s2, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = 'AntiAlias'
+    $g.Clear($global:TsakasPal.Panel)
+    $r = New-Object Drawing.Rectangle(0, 0, ($s2.Width - 1), ($s2.Height - 1))
+    $path = New-RoundPath $r 10
+    $fill = New-Object Drawing.SolidBrush($global:TsakasPal.Card)
+    $g.FillPath($fill, $path); $fill.Dispose()
+    $pen = New-Object Drawing.Pen($global:TsakasPal.Line, 1)
+    $g.DrawPath($pen, $path); $pen.Dispose(); $path.Dispose()
+    $t = New-Object Drawing.Rectangle((& $sc 18), (& $sc 18), ($s2.Width - (& $sc 36)), (& $sc 26))
+    [Windows.Forms.TextRenderer]::DrawText($g, $s2.Tag, $busyFont, $t, $global:TsakasPal.Ink,
+      [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine, EndEllipsis')
+    $track = New-Object Drawing.Rectangle((& $sc 18), (& $sc 56), ($s2.Width - (& $sc 36)), (& $sc 6))
+    $tp = New-RoundPath $track 3
+    $tb = New-Object Drawing.SolidBrush($global:TsakasPal.Section)
+    $g.FillPath($tb, $tp); $tb.Dispose(); $tp.Dispose()
+    if ($global:TsakasBusyMax -gt 0) {
+      $w = [int]($track.Width * [Math]::Min(1.0, $global:TsakasBusyValue / $global:TsakasBusyMax))
+      if ($w -gt 2) {
+        $done = New-Object Drawing.Rectangle($track.X, $track.Y, $w, $track.Height)
+        $dp = New-RoundPath $done 3
+        $db = New-Object Drawing.SolidBrush($global:TsakasPal.AccentFill)
+        $g.FillPath($db, $dp); $db.Dispose(); $dp.Dispose()
+      }
+    }
+  }.GetNewClosure())
+  $form.Controls.Add($busyCard)
+
+  $busyPlace = {
+    $busyCard.Location = New-Object Drawing.Point(
+      ($side.Width + [int](($form.ClientSize.Width - $side.Width - $busyCard.Width) / 2)),
+      [int](($form.ClientSize.Height - $busyCard.Height) / 2))
+  }
+
+  # $Steps turns the bar on; without it the bar stays an empty track, because a
+  # scan cannot report progress from inside a single blocking call
+  $busy = {
+    param($text, $Steps = 0)
+    $script:busyNow = $true
+    $global:TsakasBusyMax = $Steps
+    $global:TsakasBusyValue = 0
+    $busyCard.Tag = $text
+    & $busyPlace
+    $busyCard.Visible = $true
+    $busyCard.BringToFront()
+    $busyCard.Refresh()          # paint it now: after this the thread is gone
+    [Windows.Forms.Application]::DoEvents()
+  }
+  $busyStep = {
+    param($done)
+    $global:TsakasBusyValue = $done
+    $busyCard.Refresh()
+  }
+  $idle = {
+    $busyCard.Visible = $false
+    $global:TsakasBusyMax = 0
+    $script:busyNow = $false
+  }
+
   # Swap the palette under the running window. Painted parts read $global:TsakasPal, so
   # they only need repainting; colours set as properties are remapped old to new.
   $applyTheme = {
@@ -2339,12 +2413,16 @@ function Show-Gui {
     foreach ($n in $navs) { $n.Invalidate() }
     $form.Cursor = 'WaitCursor'
     $first = $false
+    # only the first visit to a page reads anything; after that a switch is instant
+    $wait = ($index -eq 2 -and -not $script:boardLoaded) -or ($index -eq 3 -and -not $script:netLoaded) -or
+            ($index -eq 4 -and -not $script:appLoaded)
+    if ($wait -and $form.Visible) { & $busy ("Reading {0}..." -f $navs[$index].Text) }
     try {
       if ($index -eq 2 -and -not $script:boardLoaded) { & $loadBoard; $script:boardLoaded = $true; $first = $true }
       if ($index -eq 3 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true; $first = $true }
       if ($index -eq 4 -and -not $script:appLoaded)   { & $loadApps;  $script:appLoaded  = $true; $first = $true }
       if ($index -eq 5) { & $loadSettings }
-    } finally { $form.Cursor = 'Default' }
+    } finally { $form.Cursor = 'Default'; & $idle }
     # a list gets its tick glyphs only once its own window exists, and these pages
     # are built while they are hidden - so the first time one is opened, again
     if ($first) { $form.BeginInvoke([Action]{ & $buildChecks }) | Out-Null }
@@ -2659,7 +2737,11 @@ function Show-Gui {
     }
   })
 
-  $btnRefresh.Add_Click({ & $refresh })
+  $btnRefresh.Add_Click({
+    if ($script:busyNow) { return }     # DoEvents lets a second click through
+    & $busy 'Scanning processes and services...'
+    try { & $refresh } finally { & $idle }
+  })
 
   $btnApply.Add_Click({
     # the rows, not the visible items: a tick inside a folded section still counts
@@ -2682,12 +2764,18 @@ function Show-Gui {
     $ans = & $dialog "Apply to these $($items.Count) item(s)?`r`n`r`n$names$warn" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
 
-    $freed = 0.0; $errs = @()
-    foreach ($row in $items) {
-      try { $freed += Invoke-Finding $row }
-      catch { $errs += "{0}: {1}" -f $row.Label, $_.Exception.Message }
-    }
-    & $refresh
+    $freed = 0.0; $errs = @(); $done = 0
+    & $busy 'Applying changes...' $items.Count
+    try {
+      foreach ($row in $items) {
+        try { $freed += Invoke-Finding $row }
+        catch { $errs += "{0}: {1}" -f $row.Label, $_.Exception.Message }
+        $done++
+        & $busyStep $done
+      }
+      $busyCard.Tag = 'Rescanning...'
+      & $refresh
+    } finally { & $idle }
     $status.Text = "Freed about {0} MB.{1}" -f [math]::Round($freed, 1),
       $(if ($errs) { "  Failed: " + ($errs -join ' | ') } else { '' })
   })
@@ -3046,12 +3134,18 @@ function Show-Gui {
     } else { '' })
     $ans = & $dialog "Apply these changes?`r`n`r`n$names$warn" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
-    $done = 0; $errs = @()
-    foreach ($r in $items) {
-      try { Invoke-AppAction $r; $done++ }
-      catch { $errs += "$($r.App) $($r.Action): $($_.Exception.Message)" }
-    }
-    & $loadApps
+    $done = 0; $errs = @(); $step = 0
+    & $busy 'Applying changes...' $items.Count
+    try {
+      foreach ($r in $items) {
+        try { Invoke-AppAction $r; $done++ }
+        catch { $errs += "$($r.App) $($r.Action): $($_.Exception.Message)" }
+        $step++
+        & $busyStep $step
+      }
+      $busyCard.Tag = 'Rescanning...'
+      & $loadApps
+    } finally { & $idle }
     $atext.Text = "Applied $done action(s).$(if ($errs) { "`r`n`r`nFailed:`r`n$($errs -join "`r`n")" } else { '' })"
   })
 
