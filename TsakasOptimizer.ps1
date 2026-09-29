@@ -24,7 +24,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.12'
+$Version = '13.1.13'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -523,8 +523,14 @@ function Invoke-Finding($f) {
     return $f.RamMB
   }
   $target = $(if ($f.Target) { $f.Target } else { 'Manual' })
-  if ("$($f.Mode)" -eq 'Disabled') { throw 'already disabled, nothing left to turn off' }
   if (-not (Test-Admin)) { throw 'needs Administrator' }
+  # a disabled service has nowhere lower to go, so for one of those Apply means
+  # turning it back on - Target is Manual or Automatic, picked at Apply time
+  if ("$($f.Mode)" -eq 'Disabled') {
+    if ($f.Target -notin @('Manual', 'Automatic')) { throw 'already disabled, and no start type was chosen' }
+    Set-Service -Name $f.Name -StartupType $f.Target -ErrorAction Stop
+    return 0
+  }
   $svc = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $f.Name)
   Set-Service -Name $f.Name -StartupType $target -ErrorAction Stop
   if ($svc.State -eq 'Running') { Stop-Service -Name $f.Name -Force -ErrorAction SilentlyContinue }
@@ -1404,8 +1410,15 @@ function Get-UltimatePlan {
   @(Get-PowerPlans | Where-Object { $_.Guid -eq $UltimateTemplate -or $_.Name -match 'Ultimate' })[0]
 }
 
+# Reads the list back afterwards: powercfg reports success either way.
+function Set-ActivePlan([string]$Guid) {
+  [void](powercfg /setactive $Guid 2>&1)
+  $now = @(Get-PowerPlans | Where-Object { $_.Active })[0]
+  if (-not $now -or $now.Guid -ne $Guid) { throw 'Windows did not switch to it' }
+}
+
 # Copies the hidden template if this PC does not have the plan yet, then makes it
-# the active one. Reads the list back: powercfg reports success either way.
+# the active one.
 function Enable-UltimatePlan {
   $plan = Get-UltimatePlan
   if (-not $plan) {
@@ -1413,9 +1426,7 @@ function Enable-UltimatePlan {
     $plan = Get-UltimatePlan
     if (-not $plan) { throw "Windows would not add the plan: $out" }
   }
-  [void](powercfg /setactive $plan.Guid 2>&1)
-  $now = @(Get-PowerPlans | Where-Object { $_.Active })[0]
-  if (-not $now -or $now.Guid -ne $plan.Guid) { throw 'Windows did not switch to it' }
+  Set-ActivePlan $plan.Guid
   $plan
 }
 
@@ -2094,8 +2105,10 @@ function Show-Gui {
     $d.MinimizeBox = $false
     $d.ShowInTaskbar = $false
     $d.StartPosition = 'CenterParent'
-    $d.BackColor = $panel
-    $d.ForeColor = $ink
+    # the palette of the moment: a dialog opened after a theme switch was
+    # coming up in the colours the window started with
+    $d.BackColor = $global:TsakasPal.Panel
+    $d.ForeColor = $global:TsakasPal.Ink
     $d.Font = New-Object Drawing.Font($family, 10)
 
     $lbl = New-Object Windows.Forms.Label
@@ -2103,7 +2116,7 @@ function Show-Gui {
     $lbl.AutoSize = $true
     $lbl.MaximumSize = New-Object Drawing.Size(460, 0)
     $lbl.Location = New-Object Drawing.Point(24, 24)
-    $lbl.ForeColor = $ink
+    $lbl.ForeColor = $global:TsakasPal.Ink
     $d.Controls.Add($lbl)
     $d.ClientSize = New-Object Drawing.Size([Math]::Max(360, ($lbl.Right + 24)), ($lbl.Bottom + 78))
 
@@ -2118,7 +2131,14 @@ function Show-Gui {
       $d.Controls.Add($b)
       $b
     }
-    if ($buttons -eq 'YesNo') {
+    if ($buttons -eq 'ManualAuto') {
+      # the results keep their stock names; the caller maps Yes to Manual, No to Automatic
+      $man  = & $mkDlgButton 'Manual'    'Yes'    $true  ($d.ClientSize.Width - 348)
+      $auto = & $mkDlgButton 'Automatic' 'No'     $false ($d.ClientSize.Width - 236)
+      $can  = & $mkDlgButton 'Cancel'    'Cancel' $false ($d.ClientSize.Width - 124)
+      $d.AcceptButton = $man
+      $d.CancelButton = $can
+    } elseif ($buttons -eq 'YesNo') {
       $yes = & $mkDlgButton 'Yes' 'Yes' $true ($d.ClientSize.Width - 236)
       $no  = & $mkDlgButton 'No'  'No'  $false ($d.ClientSize.Width - 124)
       $d.AcceptButton = $yes
@@ -2130,9 +2150,10 @@ function Show-Gui {
     }
 
     try {
-      $titleDark = $(if ($dark) { 1 } else { 0 })
-      $cap = [int]$panel.R -bor ([int]$panel.G -shl 8) -bor ([int]$panel.B -shl 16)
-      $txt = [int]$ink.R -bor ([int]$ink.G -shl 8) -bor ([int]$ink.B -shl 16)
+      $titleDark = $(if ($global:TsakasThemeDark) { 1 } else { 0 })
+      $pc = $global:TsakasPal.Panel; $ic = $global:TsakasPal.Ink
+      $cap = [int]$pc.R -bor ([int]$pc.G -shl 8) -bor ([int]$pc.B -shl 16)
+      $txt = [int]$ic.R -bor ([int]$ic.G -shl 8) -bor ([int]$ic.B -shl 16)
       [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 20, [ref]$titleDark, 4)
       [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 35, [ref]$cap, 4)
       [void][TsakasNative]::DwmSetWindowAttribute($d.Handle, 36, [ref]$txt, 4)
@@ -2704,7 +2725,7 @@ function Show-Gui {
       if ($f -and $f.PSObject.Properties.Name -contains 'Match') { return }
       $details.Text = "{0}`r`n{1}" -f $f.Why,
         $(if ($f.Action -eq 'Kill') { 'Closing it now. It starts again next time you open the app.' }
-          elseif ("$($f.Mode)" -eq 'Disabled') { 'Already disabled - ticking it changes nothing.' }
+          elseif ("$($f.Mode)" -eq 'Disabled') { 'Disabled. Tick it and press Apply to turn it back on - you choose Manual or Automatic.' }
           elseif ($f.Target -eq 'Disabled') { 'Start type becomes Disabled: it will not start at all until you turn it back on.' }
           else { 'Start type becomes Manual: Windows starts it only when something asks for it.' })
     }
@@ -2819,10 +2840,19 @@ function Show-Gui {
       [void](& $dialog 'Tick at least one row first.' 'TsakasOptimizer' 'OK')
       return
     }
+    $revive = @($items | Where-Object { $_.Type -eq 'Service' -and "$($_.Mode)" -eq 'Disabled' })
+    if ($revive.Count) {
+      $which = ($revive | ForEach-Object { $_.Label }) -join ', '
+      $ask = $(if ($revive.Count -eq 1) { "$which is disabled.`r`n`r`nTurn it back on as" }
+               else { "$($revive.Count) of the services you ticked are disabled: $which.`r`n`r`nTurn them back on as" })
+      $how = & $dialog ("$ask`r`n  Manual - starts only when something asks for it`r`n  Automatic - starts with Windows, from the next restart") 'Disabled services' 'ManualAuto'
+      if ("$how" -notin @('Yes', 'No')) { return }
+      $start = $(if ("$how" -eq 'Yes') { 'Manual' } else { 'Automatic' })
+      foreach ($r in $revive) { $r.Target = $start }
+    }
     $names = ($items | ForEach-Object {
       $t = $_
       $(if ($t.Action -eq 'Kill') { "{0} - close it" -f $t.Label }
-        elseif ("$($t.Mode)" -eq 'Disabled') { "{0} - already disabled, nothing to change" -f $t.Label }
         else { "{0} - start type {1} to {2}" -f $t.Label, $t.Mode, $t.Target })
     }) -join "`r`n"
     $system = @($items | Where-Object { $_.System })
@@ -3386,14 +3416,15 @@ function Show-Gui {
   $planTitle.Location = New-Object Drawing.Point(16, 12)
   $planCard.Controls.Add($planTitle)
 
-  $planList = New-Object Windows.Forms.Label
-  $planList.Font = New-Object Drawing.Font($family, 10)
-  $planList.ForeColor = $ink
-  $planList.AutoSize = $false
-  $planList.Location = New-Object Drawing.Point(16, ($planTitle.Bottom + 8))
-  $planList.Size = New-Object Drawing.Size(($planCard.Width - 32), 20)
-  $planList.Anchor = 'Top,Left,Right'
-  $planCard.Controls.Add($planList)
+  # rebuilt on every refresh, one row per plan
+  $planRows = New-Object Windows.Forms.Panel
+  $planRows.Location = New-Object Drawing.Point(16, ($planTitle.Bottom + 6))
+  $planRows.Size = New-Object Drawing.Size(($planCard.Width - 32), 20)
+  $planRows.Anchor = 'Top,Left,Right'
+  $planRows.BackColor = $card
+  $planCard.Controls.Add($planRows)
+  $planNameFont = New-Object Drawing.Font($family, 10)
+  $planTagFont  = New-Object Drawing.Font($semi, 9)
 
   $powerStatus = New-Object Windows.Forms.Label
   $powerStatus.Location = New-Object Drawing.Point(12, $btnRowY)
@@ -3406,14 +3437,56 @@ function Show-Gui {
   $refreshPower = {
     $plans = @(Get-PowerPlans)
     $active = @($plans | Where-Object { $_.Active })[0]
-    $powerSub.Text = "In use: {0}" -f $(if ($active) { $active.Name } else { 'unknown' })
-    $planList.Text = ($plans | ForEach-Object {
-      $(if ($_.Active) { "{0}   -  in use" -f $_.Name } else { $_.Name })
-    }) -join "`r`n"
-    # one line per plan, measured so a long list never clips
-    $planList.Height = [Windows.Forms.TextRenderer]::MeasureText("$($planList.Text) ", $planList.Font).Height + 4
-    $planCard.Height = $planList.Bottom + 14
     $ult = @($plans | Where-Object { $_.Guid -eq $UltimateTemplate -or $_.Name -match 'Ultimate' })[0]
+    $powerSub.Text = "In use: {0}{1}" -f $(if ($active) { $active.Name } else { 'unknown' }),
+      $(if ($ult -and $ult.Active) { '' } else { '.  Suggested: Ultimate Performance.' })
+
+    foreach ($c in @($planRows.Controls)) { $c.Dispose() }
+    $y = 0
+    foreach ($p in $plans) {
+      $isUlt = ($ult -and $p.Guid -eq $ult.Guid)
+      $name = New-Object Windows.Forms.Label
+      $name.Text = $p.Name
+      $name.Font = $planNameFont
+      $name.ForeColor = $global:TsakasPal.Ink
+      $name.AutoSize = $true
+      $name.Location = New-Object Drawing.Point(0, ($y + 9))
+      $planRows.Controls.Add($name)
+      if ($isUlt) {
+        $tag = New-Object Windows.Forms.Label
+        $tag.Text = 'Suggested for gaming'
+        $tag.Font = $planTagFont
+        $tag.ForeColor = $global:TsakasPal.Accent
+        $tag.AutoSize = $true
+        $tag.Location = New-Object Drawing.Point(($name.Right + 10), ($y + 10))
+        $planRows.Controls.Add($tag)
+      }
+      $use = New-Object Windows.Forms.Button
+      $use.Size = New-Object Drawing.Size(150, 30)
+      $use.Location = New-Object Drawing.Point(($planRows.Width - 150), ($y + 3))
+      $use.Anchor = 'Top,Right'
+      $use.Text = $(if ($p.Active) { 'In use' } else { 'Use this plan' })
+      $use.Enabled = -not $p.Active
+      $use.Tag = $p
+      # the suggested plan gets the filled button while it is not the one in use
+      & $flat $use ([bool]($isUlt -and -not $p.Active))
+      $use.Add_Click({
+        param($s, $e)
+        $pick = $s.Tag
+        try {
+          Set-ActivePlan $pick.Guid
+          $powerStatus.Text = "Now using $($pick.Name)."
+        } catch {
+          $powerStatus.Text = "Could not switch to $($pick.Name): $($_.Exception.Message)"
+        }
+        # not from inside this handler: the refresh disposes the button being clicked
+        $form.BeginInvoke([Action]{ & $refreshPower }) | Out-Null
+      })
+      $planRows.Controls.Add($use)
+      $y += 38
+    }
+    $planRows.Height = $y
+    $planCard.Height = $planRows.Bottom + 12
     if ($ult -and $ult.Active) {
       $btnUltimate.Text = 'Ultimate Performance - in use'
       $btnUltimate.Enabled = $false
@@ -3829,6 +3902,9 @@ function Invoke-SelfTest {
     @{N = 'every plan has a name and a guid';     R = (@(Get-PowerPlans | Where-Object {
         $_.Name -and $_.Guid -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' }).Count -eq @(Get-PowerPlans).Count)}
     @{N = 'exactly one plan is the active one';   R = (@(Get-PowerPlans | Where-Object { $_.Active }).Count -eq 1)}
+    @{N = 'switching to the plan in use works';   R = (& {
+        $now = @(Get-PowerPlans | Where-Object { $_.Active })[0]
+        try { Set-ActivePlan $now.Guid; $true } catch { $false } })}
     # motherboard tab
     @{N = 'a 2 year old BIOS is flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-24);AgeMonths=24;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'over 18 months old'}
     @{N = 'a recent BIOS is not flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'Recent BIOS'}
