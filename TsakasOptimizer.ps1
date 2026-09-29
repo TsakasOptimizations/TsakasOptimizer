@@ -24,7 +24,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.11'
+$Version = '13.1.12'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -1379,6 +1379,46 @@ function Test-WidgetsInstalled {
   return $null -ne (Get-AppxPackage -Name 'MicrosoftWindows.Client.WebExperience' -ErrorAction SilentlyContinue)
 }
 
+# The Ultimate Performance scheme ships hidden: it exists as a template you copy,
+# and the copy gets a GUID of its own, so a PC that already has it will not show
+# the template's GUID anywhere. Match the name as well.
+$UltimateTemplate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
+
+function Get-PowerPlans {
+  $plans = New-Object System.Collections.ArrayList
+  foreach ($line in @(powercfg /list 2>$null)) {
+    if ($line -notmatch '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') { continue }
+    $guid = $Matches[1]
+    $name = ''
+    if ($line -match '\(([^)]*)\)') { $name = $Matches[1].Trim() }
+    [void]$plans.Add([pscustomobject]@{
+      Name   = $(if ($name) { $name } else { 'Unnamed plan' })
+      Guid   = $guid
+      Active = ($line.TrimEnd().EndsWith('*'))
+    })
+  }
+  $plans
+}
+
+function Get-UltimatePlan {
+  @(Get-PowerPlans | Where-Object { $_.Guid -eq $UltimateTemplate -or $_.Name -match 'Ultimate' })[0]
+}
+
+# Copies the hidden template if this PC does not have the plan yet, then makes it
+# the active one. Reads the list back: powercfg reports success either way.
+function Enable-UltimatePlan {
+  $plan = Get-UltimatePlan
+  if (-not $plan) {
+    $out = powercfg -duplicatescheme $UltimateTemplate 2>&1
+    $plan = Get-UltimatePlan
+    if (-not $plan) { throw "Windows would not add the plan: $out" }
+  }
+  [void](powercfg /setactive $plan.Guid 2>&1)
+  $now = @(Get-PowerPlans | Where-Object { $_.Active })[0]
+  if (-not $now -or $now.Guid -ne $plan.Guid) { throw 'Windows did not switch to it' }
+  $plan
+}
+
 function Get-WinSettings {
   @(
     [pscustomobject]@{
@@ -2144,7 +2184,7 @@ function Show-Gui {
   $iconFamily = & $pickFamily 'Segoe Fluent Icons' (& $pickFamily 'Segoe MDL2 Assets' $null)
   $iconFont = if ($iconFamily) { New-Object Drawing.Font($iconFamily, 11) } else { $null }
   $navFont = New-Object Drawing.Font($family, 10)
-  $navIcons = @([char]0xE9D9, [char]0xE964, [char]0xE950, [char]0xE968, [char]0xE8A9, [char]0xE713)
+  $navIcons = @([char]0xE9D9, [char]0xE964, [char]0xE950, [char]0xE968, [char]0xE8A9, [char]0xE713, [char]0xE7E8)
   $navSelFill = $pal.NavSel
   $navHoverFill = $pal.NavHover
   $navState = New-Object psobject -Property @{ Selected = 0; Hover = -1 }
@@ -2196,6 +2236,7 @@ function Show-Gui {
     @{ Title = 'Network';                Sub = 'Adapter power saving that quietly costs you latency' }
     @{ Title = 'App Optimizer';          Sub = 'Everything that starts with Windows, the caches worth clearing, and Store apps you can remove' }
     @{ Title = 'Windows Settings';       Sub = 'The Windows features that quietly cost you performance, as switches' }
+    @{ Title = 'Power Plan';             Sub = 'Which power plan Windows is running, and Ultimate Performance in one click' }
   )
 
   $panes = @()
@@ -2405,6 +2446,7 @@ function Show-Gui {
   $tab4 = $bodies[3]
   $tab5 = $bodies[4]
   $tab6 = $bodies[5]
+  $tab7 = $bodies[6]
 
   $selectSection = {
     param($index)
@@ -2422,6 +2464,7 @@ function Show-Gui {
       if ($index -eq 3 -and -not $script:netLoaded)   { & $loadNet;   $script:netLoaded   = $true; $first = $true }
       if ($index -eq 4 -and -not $script:appLoaded)   { & $loadApps;  $script:appLoaded  = $true; $first = $true }
       if ($index -eq 5) { & $loadSettings }
+      if ($index -eq 6) { & $refreshPower }
     } finally { $form.Cursor = 'Default'; & $idle }
     # a list gets its tick glyphs only once its own window exists, and these pages
     # are built while they are hidden - so the first time one is opened, again
@@ -2433,11 +2476,29 @@ function Show-Gui {
   $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false
   $summary = New-Object Windows.Forms.Label
   $summary.Location = New-Object Drawing.Point(14, 8)
-  $summary.Size = New-Object Drawing.Size($ctlW, 22)
+  $summary.Size = New-Object Drawing.Size(($ctlW - 270), 22)
   $summary.Anchor = 'Top,Left,Right'
   $summary.ForeColor = $ink
   $summary.Font = New-Object Drawing.Font($semi, 10)
   $tab1.Controls.Add($summary)
+
+  # 338 rows with no way to find one by name was the worst of it
+  $filterBox = New-Object Windows.Forms.TextBox
+  $filterBox.Location = New-Object Drawing.Point((14 + $ctlW - 256), 4)
+  $filterBox.Size = New-Object Drawing.Size(256, 24)
+  $filterBox.Anchor = 'Top,Right'
+  $filterBox.BorderStyle = 'FixedSingle'
+  $filterBox.BackColor = $card
+  $filterBox.ForeColor = $ink
+  $tab1.Controls.Add($filterBox)
+  $script:rowFilter = ''
+
+  # both halves of what a row calls itself, so "audio" finds RtkAudUService
+  $passesFilter = {
+    param($f)
+    if (-not $script:rowFilter) { return $true }
+    "$($f.Label) $($f.Name)".IndexOf($script:rowFilter, [StringComparison]::OrdinalIgnoreCase) -ge 0
+  }
 
   $lv.Location = New-Object Drawing.Point(12, 34)
   $lv.Size = New-Object Drawing.Size($ctlW, ($btnRowY - 174))
@@ -2479,9 +2540,12 @@ function Show-Gui {
     $lv.BeginUpdate()
     $lv.Items.Clear()
     foreach ($sec in $sections) {
-      $mine = @($script:allRows | Where-Object { & $sec.Match $_ })
+      $mine = @($script:allRows | Where-Object { (& $sec.Match $_) -and (& $passesFilter $_) })
+      # a search shows what it found, and a category with no match is not a row
+      $open = $sec.Open -or [bool]$script:rowFilter
+      if ($script:rowFilter -and $mine.Count -eq 0) { continue }
       $head = New-Object Windows.Forms.ListViewItem(("{0}  {1}  ({2})" -f `
-        $(if ($sec.Open) { $chevronOpen } else { $chevronShut }), $sec.Title, $mine.Count))
+        $(if ($open) { $chevronOpen } else { $chevronShut }), $sec.Title, $mine.Count))
       [void]$head.SubItems.Add('')
       [void]$head.SubItems.Add('')
       [void]$head.SubItems.Add('')
@@ -2491,7 +2555,7 @@ function Show-Gui {
       $head.Tag = $sec
       [void]$lv.Items.Add($head)
       $head.Checked = ($mine.Count -gt 0 -and @($mine | Where-Object { -not $_.Ticked }).Count -eq 0)
-      if (-not $sec.Open) { continue }
+      if (-not $open) { continue }
       foreach ($f in $mine) {
         $it = New-Object Windows.Forms.ListViewItem($f.Label + $(if ($f.Count -gt 1) { " x$($f.Count)" } else { '' }))
         $it.UseItemStyleForSubItems = $false     # or the mark takes the row's colour
@@ -2627,7 +2691,7 @@ function Show-Gui {
     $want = ($e.NewValue -eq 'Checked')
     if ($tag.PSObject.Properties.Name -contains 'Match') {
       # the box on a section header ticks everything in that section
-      foreach ($f in @($script:allRows | Where-Object { & $tag.Match $_ })) { $f.Ticked = $want }
+      foreach ($f in @($script:allRows | Where-Object { (& $tag.Match $_) -and (& $passesFilter $_) })) { $f.Ticked = $want }
       $lv.BeginInvoke([Action]{ & $fillList }) | Out-Null
       return
     }
@@ -2735,6 +2799,11 @@ function Show-Gui {
     } catch {
       [void](& $dialog "Update failed: $($_.Exception.Message)" 'Update failed' 'OK')
     }
+  })
+
+  $filterBox.Add_TextChanged({
+    $script:rowFilter = $filterBox.Text.Trim()
+    & $fillList
   })
 
   $btnRefresh.Add_Click({
@@ -3196,6 +3265,7 @@ function Show-Gui {
   # a switch whose feature is not installed on this PC is left out entirely
   $settings = @(Get-WinSettings | Where-Object { -not $_.Available -or (& $_.Available) })
   $rowY = 0
+
   $lastGroup = ''
   for ($i = 0; $i -lt $settings.Count; $i++) {
     if ($settings[$i].Group -ne $lastGroup) {
@@ -3264,6 +3334,108 @@ function Show-Gui {
   $setStatus.ForeColor = $muted
   $setStatus.Text = 'Each switch applies the moment you flip it, the same as the Settings app.'
   $tab6.Controls.Add($setStatus)
+
+  # ---- Power Plan ----
+  # A list and a one-off action rather than on/off switches, so it is a page of
+  # its own instead of rows from Get-WinSettings.
+  $powerRow = New-Object Windows.Forms.Panel
+  $powerRow.Location = New-Object Drawing.Point(12, 12)
+  $powerRow.Size = New-Object Drawing.Size($ctlW, 70)
+  $powerRow.Anchor = 'Top,Left,Right'
+  $powerRow.BackColor = $card
+  $tab7.Controls.Add($powerRow)
+  Set-Rounded $powerRow 10
+
+  $powerTitle = New-Object Windows.Forms.Label
+  $powerTitle.Text = 'Active plan'
+  $powerTitle.Font = New-Object Drawing.Font($semi, 10)
+  $powerTitle.ForeColor = $ink
+  $powerTitle.AutoSize = $true
+  $powerTitle.Location = New-Object Drawing.Point(16, 12)
+  $powerRow.Controls.Add($powerTitle)
+
+  $powerSub = New-Object Windows.Forms.Label
+  $powerSub.Font = New-Object Drawing.Font($small, 9)
+  $powerSub.ForeColor = $muted
+  $powerSub.AutoSize = $false
+  $powerSub.Size = New-Object Drawing.Size(($powerRow.Width - 280), 20)
+  $powerSub.Location = New-Object Drawing.Point(16, ($powerTitle.Bottom + 3))
+  $powerSub.Anchor = 'Top,Left,Right'
+  $powerRow.Controls.Add($powerSub)
+
+  $btnUltimate = New-Object Windows.Forms.Button
+  $btnUltimate.Size = New-Object Drawing.Size(240, 30)
+  $btnUltimate.Location = New-Object Drawing.Point(($powerRow.Width - 256), 20)
+  $btnUltimate.Anchor = 'Top,Right'
+  & $flat $btnUltimate $false
+  $powerRow.Controls.Add($btnUltimate)
+
+  $planCard = New-Object Windows.Forms.Panel
+  $planCard.Location = New-Object Drawing.Point(12, ($powerRow.Bottom + 12))
+  $planCard.Size = New-Object Drawing.Size($ctlW, 60)
+  $planCard.Anchor = 'Top,Left,Right'
+  $planCard.BackColor = $card
+  $tab7.Controls.Add($planCard)
+  Set-Rounded $planCard 10
+
+  $planTitle = New-Object Windows.Forms.Label
+  $planTitle.Text = 'Plans on this PC'
+  $planTitle.Font = New-Object Drawing.Font($semi, 10)
+  $planTitle.ForeColor = $ink
+  $planTitle.AutoSize = $true
+  $planTitle.Location = New-Object Drawing.Point(16, 12)
+  $planCard.Controls.Add($planTitle)
+
+  $planList = New-Object Windows.Forms.Label
+  $planList.Font = New-Object Drawing.Font($family, 10)
+  $planList.ForeColor = $ink
+  $planList.AutoSize = $false
+  $planList.Location = New-Object Drawing.Point(16, ($planTitle.Bottom + 8))
+  $planList.Size = New-Object Drawing.Size(($planCard.Width - 32), 20)
+  $planList.Anchor = 'Top,Left,Right'
+  $planCard.Controls.Add($planList)
+
+  $powerStatus = New-Object Windows.Forms.Label
+  $powerStatus.Location = New-Object Drawing.Point(12, $btnRowY)
+  $powerStatus.Size = New-Object Drawing.Size($ctlW, 30)
+  $powerStatus.Anchor = 'Left,Right,Bottom'
+  $powerStatus.ForeColor = $muted
+  $powerStatus.Text = 'Switching plans applies at once. Nothing restarts.'
+  $tab7.Controls.Add($powerStatus)
+
+  $refreshPower = {
+    $plans = @(Get-PowerPlans)
+    $active = @($plans | Where-Object { $_.Active })[0]
+    $powerSub.Text = "In use: {0}" -f $(if ($active) { $active.Name } else { 'unknown' })
+    $planList.Text = ($plans | ForEach-Object {
+      $(if ($_.Active) { "{0}   -  in use" -f $_.Name } else { $_.Name })
+    }) -join "`r`n"
+    # one line per plan, measured so a long list never clips
+    $planList.Height = [Windows.Forms.TextRenderer]::MeasureText("$($planList.Text) ", $planList.Font).Height + 4
+    $planCard.Height = $planList.Bottom + 14
+    $ult = @($plans | Where-Object { $_.Guid -eq $UltimateTemplate -or $_.Name -match 'Ultimate' })[0]
+    if ($ult -and $ult.Active) {
+      $btnUltimate.Text = 'Ultimate Performance - in use'
+      $btnUltimate.Enabled = $false
+    } elseif ($ult) {
+      $btnUltimate.Text = 'Ultimate Performance - Switch to it'
+      $btnUltimate.Enabled = $true
+    } else {
+      $btnUltimate.Text = 'Ultimate Performance - Enable'
+      $btnUltimate.Enabled = $true
+    }
+    $btnUltimate.Invalidate()
+  }
+
+  $btnUltimate.Add_Click({
+    try {
+      [void](Enable-UltimatePlan)
+      $powerStatus.Text = 'Ultimate Performance is now the active plan.'
+    } catch {
+      $powerStatus.Text = "Could not switch: $($_.Exception.Message)"
+    }
+    & $refreshPower
+  })
 
   $loadSettings = {
     for ($k = 0; $k -lt $settings.Count; $k++) {
@@ -3473,6 +3645,8 @@ public static class TsakasNative {
   public static extern void RefreshImmersiveColorPolicyState();
   [DllImport("user32.dll", CharSet = CharSet.Auto)]
   public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")]
+  public static extern IntPtr SendMessageText(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
   [DllImport("user32.dll", SetLastError = true)]
   public static extern bool SystemParametersInfo(uint action, uint param, IntPtr vparam, uint winIni);
   [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")]
@@ -3542,6 +3716,8 @@ public static class TsakasNative {
     # the lists size their tick box when their window is created, so a list
     # handed the images before that keeps Windows' own 13px one
     & $buildChecks
+    # EM_SETCUEBANNER, with 1 so the hint stays until something is typed
+    try { [void][TsakasNative]::SendMessageText($filterBox.Handle, 0x1501, [IntPtr]1, 'Search by name') } catch { }
   }.GetNewClosure())
 
   # a theme switch reopens the window, so the timers of the old one stop here
@@ -3649,6 +3825,10 @@ function Invoke-SelfTest {
     @{N = 'power saving sorts as power saving';   R = ((Get-NetGroup 'Green Ethernet') -eq 'Power saving')}
     @{N = 'checksum sorts as optional latency';   R = ((Get-NetGroup 'UDP Checksum Offload (IPv6)') -eq 'Latency (optional)')}
     @{N = 'network scan runs without error';      R = ((@(Get-NetFindings)).Count -ge 0)}
+    @{N = 'power plans read off this PC';         R = ((@(Get-PowerPlans)).Count -ge 1)}
+    @{N = 'every plan has a name and a guid';     R = (@(Get-PowerPlans | Where-Object {
+        $_.Name -and $_.Guid -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' }).Count -eq @(Get-PowerPlans).Count)}
+    @{N = 'exactly one plan is the active one';   R = (@(Get-PowerPlans | Where-Object { $_.Active }).Count -eq 1)}
     # motherboard tab
     @{N = 'a 2 year old BIOS is flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-24);AgeMonths=24;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'over 18 months old'}
     @{N = 'a recent BIOS is not flagged';         R = ((Get-BiosNotes ([pscustomobject]@{Vendor='X';Model='Y';Bios='F1';BiosDate=(Get-Date).AddMonths(-2);AgeMonths=2;Cpu='AMD Ryzen 7 7800X3D'}) ) -join "`n") -match 'Recent BIOS'}
