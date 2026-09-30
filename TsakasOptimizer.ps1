@@ -4,12 +4,17 @@
   commonly safe to close or switch to Manual, and asks before touching anything.
   #>
 [CmdletBinding()]
-param([switch]$SelfTest)
+param(
+  [switch]$SelfTest,
+  # loads every function and stops: the app's own background runspace uses this
+  # to run slow work off the window's thread
+  [switch]$Worker
+)
 
 # PowerShell always gets a console and is DPI-unaware. The GUI wants neither: a
 # hidden console whichever way the script was started, and real pixels instead of
 # a window Windows stretches (and blurs) on a 125% or 150% display.
-if (-not $SelfTest) {
+if (-not $SelfTest -and -not $Worker) {
   try {
     Add-Type -Name Startup -Namespace Tsakas -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
@@ -24,7 +29,7 @@ if (-not $SelfTest) {
   } catch { }
 }
 
-$Version = '13.1.13'
+$Version = '13.1.14'
 $Stage   = 'Beta'          # shown next to the version, never compared
 $Repo    = 'TsakasOptimizations/TsakasOptimizer'
 $Branch  = 'main'
@@ -2358,6 +2363,34 @@ function Show-Gui {
   $busyCard.Size = New-Object Drawing.Size(360, 96)
   $busyCard.Visible = $false
   $busyFont = New-Object Drawing.Font($semi, 10.5)
+  # The window keeps pumping messages while it waits on the worker, and a click let
+  # through would start a second scan or apply inside the first one. Disabling the
+  # form stops that but repaints every list light grey, so input is filtered out
+  # instead: mouse and keyboard on the client area are dropped, painting carries
+  # on, and the title bar still moves and minimises the window.
+  if (-not ('TsakasGate' -as [type])) {
+    try {
+      Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+public class TsakasGate : System.Windows.Forms.IMessageFilter {
+  public static bool Closed;
+  public bool PreFilterMessage(ref System.Windows.Forms.Message m) {
+    if (!Closed) return false;
+    int w = m.Msg;
+    return (w >= 0x0100 && w <= 0x0109) || (w >= 0x0200 && w <= 0x020E);
+  }
+}
+'@
+    } catch { }
+  }
+  $hasGate = [bool]('TsakasGate' -as [type])
+  if ($hasGate) { [Windows.Forms.Application]::AddMessageFilter((New-Object TsakasGate)) }
+  $gate = {
+    param([bool]$shut)
+    if ($hasGate) { [TsakasGate]::Closed = $shut } else { $form.Enabled = -not $shut }
+  }
+  # closing the window mid-apply would leave the worker changing things unseen
+  $form.Add_FormClosing({ param($s, $e) if ($script:busyNow) { $e.Cancel = $true } })
+
   $busyCard.Add_Paint({
     param($s2, $e)
     $g = $e.Graphics
@@ -2398,6 +2431,7 @@ function Show-Gui {
   # scan cannot report progress from inside a single blocking call
   $busy = {
     param($text, $Steps = 0)
+    & $gate $true
     $script:busyNow = $true
     $global:TsakasBusyMax = $Steps
     $global:TsakasBusyValue = 0
@@ -2414,9 +2448,33 @@ function Show-Gui {
     $busyCard.Refresh()
   }
   $idle = {
+    & $gate $false
     $busyCard.Visible = $false
     $global:TsakasBusyMax = 0
     $script:busyNow = $false
+  }
+
+  # Runs $Code in a second runspace that has loaded this same script, and keeps the
+  # window painting while it waits. Windows paints a window that has not answered
+  # for five seconds white and offers to close it, and a Store app removal, a
+  # service that will not stop or Get-AppxPackage while the Store is updating can
+  # all take longer than that. Launched straight from GitHub there is no file for
+  # the worker to load, so the work runs here as it always did.
+  $background = {
+    param([string]$Code, [object[]]$Arguments = @(), $OnWait)
+    if (-not $scriptPath) { return (& ([scriptblock]::Create($Code)) @Arguments) }
+    $ps = [powershell]::Create()
+    try {
+      [void]$ps.AddScript((". '{0}' -Worker`r`n& {{`r`n{1}`r`n}} @args" -f ($scriptPath -replace "'", "''"), $Code))
+      foreach ($a in $Arguments) { [void]$ps.AddArgument($a) }
+      $h = $ps.BeginInvoke()
+      while (-not $h.IsCompleted) {
+        [Windows.Forms.Application]::DoEvents()
+        if ($OnWait) { & $OnWait }
+        Start-Sleep -Milliseconds 40
+      }
+      $ps.EndInvoke($h)
+    } finally { $ps.Dispose() }
   }
 
   # Swap the palette under the running window. Painted parts read $global:TsakasPal, so
@@ -2654,6 +2712,8 @@ function Show-Gui {
     $hit = $s.GetItemAt($e.X, $e.Y)
     if (-not $hit) { return }
     if ($hit.Tag -and $hit.Tag.PSObject.Properties.Name -contains 'Match') {
+      # the tick box on a category row ticks the category; the rest of the row folds it
+      if ("$($s.HitTest($e.X, $e.Y).Location)" -match 'StateImage') { return }
       $hit.Tag.Open = -not $hit.Tag.Open
       & $fillList
       return
@@ -2863,20 +2923,26 @@ function Show-Gui {
     $ans = & $dialog "Apply to these $($items.Count) item(s)?`r`n`r`n$names$warn" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
 
-    $freed = 0.0; $errs = @(); $done = 0
+    $sync = [hashtable]::Synchronized(@{ Done = 0; Freed = 0.0; Errors = @() })
     & $busy 'Applying changes...' $items.Count
     try {
-      foreach ($row in $items) {
-        try { $freed += Invoke-Finding $row }
-        catch { $errs += "{0}: {1}" -f $row.Label, $_.Exception.Message }
-        $done++
-        & $busyStep $done
-      }
+      # stopping a service can wait on it for half a minute
+      [void](& $background @'
+param($items, $sync)
+foreach ($row in $items) {
+  try { $sync.Freed += (Invoke-Finding $row) }
+  catch { $sync.Errors += ('{0}: {1}' -f $row.Label, $_.Exception.Message) }
+  $sync.Done++
+}
+'@ @($items, $sync) { & $busyStep $sync.Done })
       $busyCard.Tag = 'Rescanning...'
+      $busyCard.Refresh()
       & $refresh
+    } catch {
+      $sync.Errors += "the apply stopped: $($_.Exception.Message)"
     } finally { & $idle }
-    $status.Text = "Freed about {0} MB.{1}" -f [math]::Round($freed, 1),
-      $(if ($errs) { "  Failed: " + ($errs -join ' | ') } else { '' })
+    $status.Text = "Freed about {0} MB.{1}" -f [math]::Round($sync.Freed, 1),
+      $(if ($sync.Errors) { "  Failed: " + ($sync.Errors -join ' | ') } else { '' })
   })
 
   $btnElev.Add_Click({
@@ -3163,7 +3229,10 @@ function Show-Gui {
   }
 
   $loadApps = {
-    $rows = @(Get-AppFindings)
+    # Get-AppxPackage stalls whenever the Store is busy updating something
+    $rows = @()
+    try { $rows = @(& $background 'Get-AppFindings') }
+    catch { $atext.Text = "Could not read the apps: $($_.Exception.Message)"; return }
     foreach ($r in $rows) { Add-Member -InputObject $r -NotePropertyName Ticked -NotePropertyValue $false -Force }
     $script:appRows = $rows
     & $fillApps
@@ -3184,6 +3253,7 @@ function Show-Gui {
     $hit = $s.GetItemAt($e.X, $e.Y)
     if (-not $hit -or -not $hit.Tag) { return }
     if ($hit.Tag.PSObject.Properties.Name -contains 'Match') {
+      if ("$($s.HitTest($e.X, $e.Y).Location)" -match 'StateImage') { return }
       $hit.Tag.Open = -not $hit.Tag.Open
       & $fillApps
     }
@@ -3233,19 +3303,25 @@ function Show-Gui {
     } else { '' })
     $ans = & $dialog "Apply these changes?`r`n`r`n$names$warn" 'TsakasOptimizer' 'YesNo'
     if ($ans -ne 'Yes') { return }
-    $done = 0; $errs = @(); $step = 0
+    $sync = [hashtable]::Synchronized(@{ Done = 0; Ok = 0; Errors = @() })
     & $busy 'Applying changes...' $items.Count
     try {
-      foreach ($r in $items) {
-        try { Invoke-AppAction $r; $done++ }
-        catch { $errs += "$($r.App) $($r.Action): $($_.Exception.Message)" }
-        $step++
-        & $busyStep $step
-      }
+      # a Store app removal alone can take a minute
+      [void](& $background @'
+param($items, $sync)
+foreach ($r in $items) {
+  try { Invoke-AppAction $r; $sync.Ok++ }
+  catch { $sync.Errors += ('{0} {1}: {2}' -f $r.App, $r.Action, $_.Exception.Message) }
+  $sync.Done++
+}
+'@ @($items, $sync) { & $busyStep $sync.Done })
       $busyCard.Tag = 'Rescanning...'
+      $busyCard.Refresh()
       & $loadApps
+    } catch {
+      $sync.Errors += "the apply stopped: $($_.Exception.Message)"
     } finally { & $idle }
-    $atext.Text = "Applied $done action(s).$(if ($errs) { "`r`n`r`nFailed:`r`n$($errs -join "`r`n")" } else { '' })"
+    $atext.Text = "Applied $($sync.Ok) action(s).$(if ($sync.Errors) { "`r`n`r`nFailed:`r`n$($sync.Errors -join "`r`n")" } else { '' })"
   })
 
   $script:appLoaded = $false
@@ -3898,6 +3974,13 @@ function Invoke-SelfTest {
     @{N = 'power saving sorts as power saving';   R = ((Get-NetGroup 'Green Ethernet') -eq 'Power saving')}
     @{N = 'checksum sorts as optional latency';   R = ((Get-NetGroup 'UDP Checksum Offload (IPv6)') -eq 'Latency (optional)')}
     @{N = 'network scan runs without error';      R = ((@(Get-NetFindings)).Count -ge 0)}
+    @{N = 'the script loads as a worker';         R = (& {
+        if (-not $PSCommandPath) { return $true }
+        $ps = [powershell]::Create()
+        try {
+          [void]$ps.AddScript((". '{0}' -Worker`r`n[bool](Get-Command Get-AppFindings -ErrorAction SilentlyContinue) -and -not (Get-Variable form -ErrorAction SilentlyContinue)" -f ($PSCommandPath -replace "'", "''")))
+          [bool](@($ps.Invoke())[-1])
+        } finally { $ps.Dispose() } })}
     @{N = 'power plans read off this PC';         R = ((@(Get-PowerPlans)).Count -ge 1)}
     @{N = 'every plan has a name and a guid';     R = (@(Get-PowerPlans | Where-Object {
         $_.Name -and $_.Guid -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' }).Count -eq @(Get-PowerPlans).Count)}
@@ -3990,6 +4073,8 @@ function Invoke-SelfTest {
 # Service start types, machine-wide policies and the Windows caches all need
 # Administrator, so ask for it up front instead of failing halfway through. A
 # refused prompt still opens the app; it just skips what it cannot do.
+if ($Worker) { return }
+
 if (-not $SelfTest -and -not (Test-Admin) -and $PSCommandPath) {
   try {
     Start-Process powershell -Verb RunAs -ArgumentList @(
